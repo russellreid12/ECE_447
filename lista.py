@@ -29,6 +29,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import os
+import pickle
 
 # =============================================================================
 # 0. CONFIGURATION
@@ -661,6 +662,55 @@ def plot_figure3(results, config):
     plt.show()
 
 
+def plot_figure3_decimal(results, config):
+    """Plots the same data as Figure 3 but with linear scales."""
+    fig, axes = plt.subplots(1, len(config["dict_sizes"]),
+                              figsize=(12, 5), sharey=False) # sharey=False for linear scale
+
+    colors = {1: "red", 3: "orange", 7: "blue"}
+
+    for ax, m in zip(axes, config["dict_sizes"]):
+        # Plot ISTA
+        ista_iters, ista_errors = results[m]["ista"]
+        ax.plot(ista_iters[:20], ista_errors[:20],
+                "x--", color="gray", label="ISTA", linewidth=1.5, markersize=6)
+
+        # Plot LISTA for each depth T
+        for T in config["depths"]:
+            curves = results[m][T]
+            all_errors = np.array([errors for iters, errors in curves])
+            mean_errors = all_errors.mean(axis=0)
+            std_errors = all_errors.std(axis=0)
+            iters = curves[0][0]
+
+            ax.errorbar(iters, mean_errors,
+                        yerr=std_errors,
+                        fmt="o-",
+                        color=colors[T],
+                        label=f"LISTA T={T}",
+                        linewidth=1.5,
+                        markersize=6,
+                        capsize=4)
+
+        ax.set_yscale("linear") # Changed to linear
+        ax.set_xscale("linear") # Changed to linear
+        ax.set_xlabel("Iterations", fontsize=12)
+        if ax == axes[0]:
+            ax.set_ylabel("Code Prediction Error (MSE)", fontsize=12)
+        ax.set_title(f"m={m} ({'complete' if m==100 else '4x overcomplete'})",
+                     fontsize=13)
+        ax.legend(fontsize=9)
+        ax.grid(True, which="both", alpha=0.3)
+        ax.set_xticks(np.arange(0, 21, 2)) # Linear ticks
+
+    fig.suptitle("Figure 3 Reproduction (Decimal Scale)\n(error bars = std over 3 seeds)",
+                 fontsize=14)
+    plt.tight_layout()
+    plt.savefig("figure3_reproduction_decimal.png", dpi=150, bbox_inches="tight")
+    print("\nSaved figure3_reproduction_decimal.png")
+    plt.show()
+
+
 def print_table1(results, config):
     """Print reproduction of Table 1: error at T=1,3,7 for each m."""
     print("\n" + "="*55)
@@ -979,9 +1029,22 @@ def plot_data_efficiency(data_sizes, lista_errors, mlp_errors, ista_errors_at_T,
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
+    results_file = "experiment_results.pkl"
+
     # --- Experiment 1: Figure 3 reproduction (ISTA vs LISTA) ---
-    results = run_experiments(config)
+    if os.path.exists(results_file):
+        print(f"Loading saved results from {results_file}...")
+        with open(results_file, "rb") as f:
+            results = pickle.load(f)
+    else:
+        print("Running experiments to generate results...")
+        results = run_experiments(config)
+        print(f"Saving results to {results_file}...")
+        with open(results_file, "wb") as f:
+            pickle.dump(results, f)
+
     plot_figure3(results, config)
+    plot_figure3_decimal(results, config)
     print_table1(results, config)
 
     # --- Experiment 2: MLP comparison ---
