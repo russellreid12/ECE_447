@@ -3,19 +3,20 @@ ECE447 Project 1 — LISTA Reproduction
 Gregor & LeCun (2010): "Learning Fast Approximations of Sparse Coding"
 
 Reproduces:
-  - Figure 3: Code prediction error vs. iterations (ISTA vs LISTA)
+  - Figure 3: Code prediction error vs. iterations (FISTA vs LISTA)
   - Table 1: Error at T=1,3,7 iterations for different dictionary sizes
-  - Depth ablation: how T affects LISTA performance
 
-HOW TO READ THIS FILE:
-  Each section has a "WHY" comment explaining the design decision,
-  not just what the code does.
+This mirrors the paper's exact setup:
+  - Dictionary learning uses CoD (not ISTA) to generate Z* at each step
+  - Z* targets for LISTA training are generated using CoD to convergence
+  - The evaluation baseline is FISTA (not ISTA) — this is what Figure 3 shows
+  - ISTA does not appear anywhere in this pipeline
 
 MULTIPLE TRIALS NOTE:
   We train each LISTA configuration (depth T, dict size m) with NUM_SEEDS
   different random seeds. This gives error bars on our plots and satisfies
   the rubric's "multiple runs when necessary" requirement. We do NOT need
-  to re-run ISTA multiple times — it's deterministic given a fixed dictionary.
+  to re-run FISTA multiple times — it is deterministic given a fixed dictionary.
   The variance comes from LISTA's random weight initialization and SGD.
 """
 
@@ -30,41 +31,40 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import os
 import pickle
+import csv
 
 # =============================================================================
 # 0. CONFIGURATION
 # =============================================================================
 # These match the paper's two main conditions: m=100 (complete) and m=400 (4x overcomplete).
 # n=100 because MNIST patches are 10x10.
-# WHY patches instead of full images? The paper explicitly uses 10x10 image patches
-# from natural images (Berkeley DB). For MNIST we do the same: extract 10x10 patches.
+# WHY patches instead of full images? The paper explicitly uses 10x10 image patches.
 # This keeps n=100, which makes the math tractable and matches the paper's Table 1.
 
 config = {
     # Data
     "patch_size": 10,          # 10x10 patches → n=100 input dim
-    "n_patches_train": 50000,  # how many patches to extract for training
+    "n_patches_train": 50000,
     "n_patches_test": 5000,
 
     # Dictionary
     "dict_sizes": [100, 400],  # m: number of atoms. 100=complete, 400=overcomplete
-    "dict_lr": 1e-3,           # learning rate for dictionary SGD
-    "dict_epochs": 5,          # epochs to train W_d. More = better atoms, slower.
+    "dict_lr": 1e-3,
+    "dict_epochs": 5,
 
-    # Sparse coding (ISTA)
+    # Sparse coding
     "alpha": 0.5,              # sparsity penalty weight (matches paper exactly)
-    "ista_max_iters": 500,     # ISTA iterations to get "converged" Z* targets
-    "ista_tol": 1e-6,          # convergence threshold for early stopping
+    "cod_max_iters": 500,      # CoD iterations to get converged Z* targets
+    "cod_tol": 1e-6,           # convergence threshold
 
     # LISTA training
     "depths": [1, 3, 7],       # T: number of unrolled steps (matches paper's Table 1)
-    "lista_epochs": 10,        # training epochs for LISTA
+    "lista_epochs": 10,
     "lista_lr": 1e-3,
     "batch_size": 256,
 
     # Experiment
     "num_seeds": 3,            # random seeds per (T, m) condition → gives error bars
-    "eval_iters": [0, 1, 2, 3, 5, 7],  # x-axis of Figure 3
 
     # Device
     "device": (
@@ -78,11 +78,8 @@ print(f"Using device: {config['device']}")
 
 
 # =============================================================================
-# 1. DATA LOADING — taken directly from Notebook 16
+# 1. DATA LOADING
 # =============================================================================
-# WHY: We use MNIST because the paper's Table 1 gives exact numbers for it,
-# so we can validate our implementation against known ground truth.
-# We extract 10x10 patches to match the paper's n=100 input dimension.
 
 def load_mnist_patches(n_train, n_test, patch_size):
     """
@@ -94,24 +91,21 @@ def load_mnist_patches(n_train, n_test, patch_size):
     dataset = torchvision.datasets.MNIST("data", train=True, transform=transform, download=True)
 
     all_images = torch.stack([dataset[i][0].squeeze() for i in range(len(dataset))])
-    # all_images: shape (60000, 28, 28)
 
     def extract_patches(images, n_patches):
         H, W = images.shape[1], images.shape[2]
         p = patch_size
         patches = []
         for _ in range(n_patches):
-            # random image
             idx = torch.randint(0, len(images), (1,)).item()
-            # random top-left corner
             r = torch.randint(0, H - p + 1, (1,)).item()
             c = torch.randint(0, W - p + 1, (1,)).item()
-            patch = images[idx, r:r+p, c:c+p].flatten()  # shape (100,)
+            patch = images[idx, r:r+p, c:c+p].flatten()
             patches.append(patch)
-        patches = torch.stack(patches)  # shape (N, 100)
+        patches = torch.stack(patches)
 
-        # Normalize: subtract mean, divide by std (skip near-zero std patches)
-        # WHY: The paper discards patches with small std. We do the same.
+        # Normalize: subtract mean, divide by std
+        # WHY: The paper discards patches with small std. We clamp to avoid division by zero.
         means = patches.mean(dim=1, keepdim=True)
         stds = patches.std(dim=1, keepdim=True).clamp(min=1e-6)
         patches = (patches - means) / stds
@@ -127,52 +121,46 @@ def load_mnist_patches(n_train, n_test, patch_size):
 
 
 # =============================================================================
-# 2. DICTIONARY LEARNING
+# 2. SHARED UTILITY — soft thresholding
 # =============================================================================
-# WHY: We need W_d (the dictionary) before we can do anything else.
-# W_d is an n×m matrix whose columns are "atoms" — basis vectors that
-# linearly combine to reconstruct any input X ≈ W_d @ Z.
-#
-# We learn W_d by SGD: for each patch X, compute the best sparse code Z*
-# via ISTA, then update W_d to reduce reconstruction error, then renormalize
-# columns to unit norm (so no atom can trivially dominate by being large).
-#
-# This is Stage 1 of the 4-stage pipeline. We only need to do this once
-# per dictionary size m.
 
 def soft_threshold(x, theta):
     """
-    The shrinkage function h_theta(x) = sign(x) * max(|x| - theta, 0).
-    WHY: This is the proximal operator for the L1 penalty. It zeros out
-    small components (enforcing sparsity) and shrinks large ones toward zero.
-    In ISTA, theta = alpha/L where L is the Lipschitz constant of the gradient.
-    In LISTA, theta becomes a learned per-dimension vector.
+    Shrinkage function h_theta(x) = sign(x) * max(|x| - theta, 0).
+    This is the proximal operator for the L1 penalty.
+    Used in CoD, FISTA, and LISTA.
     """
     return torch.sign(x) * F.relu(x.abs() - theta)
 
 
-def ista(X, Wd, alpha, max_iters, tol=1e-6):
+# =============================================================================
+# 3. COORDINATE DESCENT (CoD) — Algorithm 2 from the paper
+# =============================================================================
+# WHY CoD and not ISTA? The paper explicitly uses CoD as its preferred exact
+# solver for both dictionary learning and Z* target generation. CoD updates
+# one carefully-chosen coordinate at a time (O(m) per step) rather than all
+# coordinates simultaneously (O(m^2) for ISTA), making it faster per iteration.
+#
+# This is used in two places:
+#   - Inside learn_dictionary: rough Z* to guide W_d gradient steps
+#   - Inside generate_targets: precise Z* as LISTA's training labels
+
+def cod(X, Wd, alpha, max_iters, tol=1e-6):
     """
-    Run ISTA to convergence to get the "true" sparse code Z*.
+    Coordinate Descent sparse coding — Algorithm 2 from Gregor & LeCun (2010).
 
-    ISTA update: Z <- h_{alpha/L}(Z - (1/L) * Wd^T @ (Wd @ Z - X))
-    Equivalently: Z <- h_{alpha/L}(We @ X + S @ Z)
-    where We = (1/L) * Wd^T  and  S = I - (1/L) * Wd^T @ Wd
-
-    WHY run 500 iterations? We need Z* to be essentially converged —
-    this is our supervision signal for training LISTA. If Z* is noisy,
-    LISTA learns to approximate a noisy target, which hurts.
+    At each step, picks the code component that would change most and updates
+    only that one. Each step costs O(m) vs ISTA's O(m^2).
 
     Args:
-        X: input patches, shape (batch, n) or (n,)
-        Wd: dictionary, shape (n, m)
-        alpha: sparsity weight
+        X:         input patches, shape (batch, n)
+        Wd:        dictionary, shape (n, m)
+        alpha:     sparsity penalty
         max_iters: maximum iterations
-        tol: stop early if Z changes less than this
+        tol:       stop if total change in Z drops below this
 
     Returns:
-        Z: sparse code, shape (batch, m) or (m,)
-        errors: list of squared errors at each step (for plotting Figure 3)
+        Z: sparse code, shape (batch, m)
     """
     batched = X.dim() == 2
     if not batched:
@@ -180,52 +168,76 @@ def ista(X, Wd, alpha, max_iters, tol=1e-6):
 
     n, m = Wd.shape
     batch = X.shape[0]
+    device = X.device
 
-    # Lipschitz constant L = largest eigenvalue of Wd^T @ Wd
-    # WHY: The ISTA step size 1/L guarantees convergence. Too large = diverges.
-    # Too small = slow. The largest eigenvalue is the tightest safe bound.
-    WtW = Wd.T @ Wd  # (m, m)
-    L = torch.linalg.eigvalsh(WtW).max().item()
-    L = max(L, 1e-6)
+    # S = I - Wd^T @ Wd (mutual inhibition matrix, as in Algorithm 2)
+    # WHY: S propagates the effect of updating one code component to all others.
+    # When component k changes by e, every Bj shifts by S_jk * e.
+    WtW = Wd.T @ Wd                              # (m, m)
+    S = torch.eye(m, device=device) - WtW        # (m, m)
 
-    # Precompute fixed matrices (this is what ISTA uses analytically)
-    We_fixed = Wd.T / L          # (m, n) — encodes X into code space
-    S_fixed = torch.eye(m, device=Wd.device) - WtW / L   # (m, m) — inhibition
-
-    theta = alpha / L            # fixed scalar threshold for ISTA
-
-    Z = torch.zeros(batch, m, device=X.device)
+    # Initialize: B = Wd^T @ X, Z = 0
+    # B accumulates the "effective input" after accounting for already-active components
+    B = X @ Wd                                   # (batch, m) — equivalent to Wd^T @ X per sample
+    Z = torch.zeros(batch, m, device=device)
 
     for t in range(max_iters):
         Z_prev = Z.clone()
-        # Core ISTA step
-        Z = soft_threshold(X @ We_fixed.T + Z @ S_fixed.T, theta)
-        # Check convergence
+
+        # Candidate update for all components
+        Z_bar = soft_threshold(B, alpha)          # (batch, m)
+
+        # Find the component with the largest change for each sample in the batch
+        diff = (Z_bar - Z).abs()                  # (batch, m)
+        k = diff.argmax(dim=1)                    # (batch,) — one index per sample
+
+        # Update only the chosen component for each sample
+        # WHY a Python loop here? CoD is inherently sequential — each step
+        # depends on the previous one. Vectorizing across the batch dimension
+        # is possible but adds complexity. For target generation (run once,
+        # cached), this is fast enough.
+        for b in range(batch):
+            kb = k[b].item()
+            e = Z_bar[b, kb] - Z[b, kb]          # scalar change for this component
+            B[b] += S[:, kb] * e                  # propagate change to all B entries
+            Z[b, kb] = Z_bar[b, kb]               # update only this component
+
+        # Convergence check
         if (Z - Z_prev).norm() < tol:
             break
+
+    # Final shrinkage pass
+    Z = soft_threshold(B, alpha)
 
     if not batched:
         Z = Z.squeeze(0)
     return Z
 
 
+# =============================================================================
+# 4. DICTIONARY LEARNING
+# =============================================================================
+# The paper's exact procedure (Section 4):
+#   (1) get image patch X_p
+#   (2) compute Z* using CoD
+#   (3) update W_d with one SGD step: W_d <- W_d - eta * dE/dW_d
+#   (4) renormalize columns of W_d to unit norm
+#   (5) repeat with 1/t decaying step size
+#
+# We use Adam instead of vanilla SGD with 1/t schedule — Adam adapts
+# its step size automatically and is more stable in practice.
+# We use CoD (matching the paper) for the Z* inference step.
+
 def learn_dictionary(X_train, m, n, config):
     """
-    Learn dictionary W_d by alternating between:
-      1. Sparse coding: compute Z* = ISTA(X, W_d)  [inference]
-      2. Dictionary update: W_d <- W_d - lr * grad  [learning]
-      3. Renormalize columns of W_d to unit norm
-
-    WHY unit norm columns? If we allow atoms to grow arbitrarily large,
-    the model can cheat by making atoms large and codes small, or vice versa.
-    Fixing ||w_j||=1 puts all atoms on equal footing and matches the paper.
+    Learn dictionary W_d by alternating CoD inference and SGD on W_d.
     """
     device = config["device"]
     print(f"\nLearning dictionary (m={m})...")
 
     # Initialize W_d randomly with unit-norm columns
     Wd = torch.randn(n, m, device=device)
-    Wd = F.normalize(Wd, dim=0)  # normalize each column
+    Wd = F.normalize(Wd, dim=0)
 
     Wd.requires_grad_(True)
     optimizer = torch.optim.Adam([Wd], lr=config["dict_lr"])
@@ -237,20 +249,23 @@ def learn_dictionary(X_train, m, n, config):
         for X_batch in tqdm(loader, desc=f"  Dict epoch {epoch+1}/{config['dict_epochs']}"):
             X_batch = X_batch.to(device)
 
-            # Step 1: get sparse codes (no grad — we're not differentiating through ISTA here)
+            # Step 1: get sparse codes via CoD (no grad — not differentiating through CoD)
+            # WHY detach? We only want to update W_d via the reconstruction loss below,
+            # not through the CoD computation itself.
             with torch.no_grad():
-                Z_star = ista(X_batch, Wd.detach(), config["alpha"],
-                              max_iters=100, tol=1e-4)
+                Z_star = cod(X_batch, Wd.detach(), config["alpha"],
+                             max_iters=100, tol=1e-4)
 
-            # Step 2: reconstruction loss — how well does W_d @ Z* reconstruct X?
-            X_recon = Z_star @ Wd.T   # (batch, n)
+            # Step 2: reconstruction loss — dE/dW_d = -(X - W_d @ Z*) @ Z*^T
+            # The L1 term drops out because it has no dependence on W_d.
+            X_recon = Z_star @ Wd.T              # (batch, n)
             loss = F.mse_loss(X_recon, X_batch)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # Step 3: renormalize columns (project back onto constraint set)
+            # Step 3: renormalize columns — no atom should dominate by being large
             with torch.no_grad():
                 Wd.data = F.normalize(Wd.data, dim=0)
 
@@ -262,65 +277,61 @@ def learn_dictionary(X_train, m, n, config):
 
 
 # =============================================================================
-# 3. GENERATE Z* TARGETS
+# 5. GENERATE Z* TARGETS via CoD
 # =============================================================================
-# WHY a separate stage? We need to run ISTA to convergence (500 iters) on
-# every training sample ONCE and cache the results. If we did this inside
-# the LISTA training loop, we'd rerun ISTA 500 times per sample per epoch,
-# which would be prohibitively slow. Caching means we run it once total.
+# WHY a separate stage? We run CoD to convergence (500 iters) on every
+# training sample once and cache the results. If we did this inside the
+# LISTA training loop, we'd rerun CoD 500 times per sample per epoch —
+# prohibitively slow. Caching means we pay this cost once.
 #
-# The tradeoff: cached Z* targets are fixed. In principle you could
-# recompute them as W_d improves, but the paper doesn't do this — W_d is
-# fixed after Stage 1, and Z* is computed once from the final W_d.
+# WHY 500 iterations? These Z* values are LISTA's ground truth labels.
+# They must be as close to truly converged as possible — noisy targets
+# mean LISTA learns to approximate a noisy signal.
 
 def generate_targets(X, Wd, config, desc="Generating Z* targets"):
-    """Run ISTA to convergence on all of X and return the sparse codes Z*."""
+    """Run CoD to convergence on all of X and cache the sparse codes Z*."""
     device = config["device"]
     Wd = Wd.to(device)
     all_Z = []
 
-    loader = DataLoader(X, batch_size=512, shuffle=False)
+    loader = DataLoader(X, batch_size=128, shuffle=False)
     for X_batch in tqdm(loader, desc=desc):
         X_batch = X_batch.to(device)
         with torch.no_grad():
-            Z = ista(X_batch, Wd, config["alpha"],
-                     max_iters=config["ista_max_iters"],
-                     tol=config["ista_tol"])
+            Z = cod(X_batch, Wd, config["alpha"],
+                    max_iters=config["cod_max_iters"],
+                    tol=config["cod_tol"])
         all_Z.append(Z.cpu())
 
     return torch.cat(all_Z, dim=0)
 
 
 # =============================================================================
-# 4. THE LISTA MODEL
+# 6. THE LISTA MODEL
 # =============================================================================
-# WHY a custom nn.Module instead of using nn.Linear layers?
+# WHY a custom nn.Module instead of nn.Linear layers?
 # Because of weight tying: We and S are shared across all T steps.
-# Standard nn.Sequential would create separate weight matrices per layer.
+# Standard nn.Sequential creates separate weight matrices per layer.
 # We need to explicitly reuse the same matrices in a loop.
 #
 # Architecture:
 #   Input: X of shape (batch, n)
-#   Step 0: Z = h_theta(We @ X)          ← initial estimate (iter=0 in Figure 3)
-#   Step t: Z = h_theta(We @ X + S @ Z)  ← refined estimate
+#   Step 0: Z = h_theta(We @ X)            ← initial estimate
+#   Step t: Z = h_theta(We @ X + S @ Z)    ← refined estimate
 #   Output: Z of shape (batch, m)
 #
-# Parameters to learn:
-#   We: (m, n) — learned encoder (replaces (1/L)*Wd^T analytically)
-#   S:  (m, m) — learned inhibition (replaces I - (1/L)*Wd^T*Wd analytically)
-#   theta: (m,) — learned per-dimension threshold (replaces scalar alpha/L)
-#
-# WHY per-dimension theta? Different code dimensions may need different
-# sparsity levels. A scalar threshold treats all dimensions the same,
-# which is suboptimal.
+# Parameters learned (shared across all T steps — weight tying):
+#   We:    (m, n) — replaces (1/L)*Wd^T from ISTA analytically
+#   S:     (m, m) — replaces I - (1/L)*Wd^T*Wd from ISTA analytically
+#   theta: (m,)   — per-dimension threshold, replaces scalar alpha/L
 
 class LISTA(nn.Module):
     def __init__(self, n, m, T, Wd=None):
         """
         Args:
-            n: input dimension (patch size^2)
-            m: code dimension (dictionary size)
-            T: number of unrolled ISTA steps (depth)
+            n:  input dimension (patch_size^2 = 100)
+            m:  code dimension (dictionary size)
+            T:  number of unrolled steps
             Wd: optional pre-trained dictionary for smart initialization
         """
         super().__init__()
@@ -328,22 +339,20 @@ class LISTA(nn.Module):
         self.n = n
         self.m = m
 
-        # Learned parameters — these replace the analytically derived matrices
         self.We = nn.Parameter(torch.empty(m, n))
         self.S = nn.Parameter(torch.empty(m, m))
         self.theta = nn.Parameter(torch.ones(m) * 0.1)
 
         # Smart initialization from W_d
-        # WHY: Starting from the ISTA-derived values gives LISTA a head start.
-        # We already know these are "pretty good" — learning can then refine them.
-        # Random init from scratch is also valid but may need more epochs.
+        # WHY: Starting from the ISTA-derived values gives LISTA a head start —
+        # we know these are already "pretty good". Learning then refines them.
         if Wd is not None:
             with torch.no_grad():
                 WtW = Wd.T @ Wd
                 L = torch.linalg.eigvalsh(WtW).max().item()
                 L = max(L, 1e-6)
-                self.We.data = (Wd.T / L).clone()           # (m, n)
-                self.S.data = (torch.eye(m) - WtW / L).clone()  # (m, m)
+                self.We.data = (Wd.T / L).clone()
+                self.S.data = (torch.eye(m) - WtW / L).clone()
                 self.theta.data = torch.full((m,), 0.5 / L)
         else:
             nn.init.xavier_uniform_(self.We)
@@ -351,27 +360,23 @@ class LISTA(nn.Module):
 
     def forward(self, X, return_all_iters=False):
         """
-        Forward pass through T unrolled ISTA steps.
+        Forward pass through T unrolled steps.
 
         Args:
-            X: input, shape (batch, n)
-            return_all_iters: if True, return Z at every step (for Figure 3 eval)
+            X:                input, shape (batch, n)
+            return_all_iters: if True, return Z at every step 0..T (for Figure 3)
 
         Returns:
-            Z: sparse code at step T, shape (batch, m)
-            (optional) all_Z: list of Z at steps 0..T
+            Z:      sparse code at step T, shape (batch, m)
+            all_Z:  list of Z at steps 0..T (only if return_all_iters=True)
         """
-        # Initial estimate (step 0 in Figure 3)
-        # WHY: We@X alone is already a reasonable encoder — it's the baseline
-        # "single-layer encoder" in Table 1. Subsequent steps refine it.
-        B = F.linear(X, self.We)          # (batch, m) — We @ X
-        Z = soft_threshold(B, self.theta) # step 0
+        B = F.linear(X, self.We)           # (batch, m) — We @ X, shared across steps
+        Z = soft_threshold(B, self.theta)  # step 0: initial estimate
 
         all_Z = [Z] if return_all_iters else None
 
         for t in range(self.T):
-            # Z = h_theta(We @ X + S @ Z_prev)
-            C = B + F.linear(Z, self.S)   # (batch, m)
+            C = B + F.linear(Z, self.S)    # We @ X + S @ Z
             Z = soft_threshold(C, self.theta)
             if return_all_iters:
                 all_Z.append(Z)
@@ -382,49 +387,28 @@ class LISTA(nn.Module):
 
 
 # =============================================================================
-# 5. LISTA TRAINING
+# 7. LISTA TRAINING
 # =============================================================================
-# WHY supervised learning (not the sparse coding energy)?
-# LISTA is trained to directly minimize ||Z_predicted - Z*||^2,
-# where Z* is the converged ISTA solution. This is much easier to
-# optimize than the full energy E(X, Z) = ||X - Wd@Z||^2 + alpha*||Z||_1,
-# because we have explicit targets.
-#
-# This is also why we needed Stage 3 (generate Z*) — without those targets,
-# we couldn't do supervised training.
+# LISTA is trained to minimize ||Z_predicted - Z*||^2, where Z* comes from CoD.
+# This is supervised learning with explicit targets — much easier to optimize
+# than the full sparse coding energy directly.
 #
 # Backprop through LISTA is like BPTT in RNNs:
-# dL/dS = sum_{t=1}^{T} dL/dZ(t) * dZ(t)/dS
-# Since S is shared, gradients from all steps accumulate for S (and We, theta).
-# PyTorch handles this automatically via autograd when we do loss.backward().
+#   dL/dS = sum_{t=1}^{T} dL/dZ(t) * dZ(t)/dS
+# Since We, S, theta are shared across all T steps, their gradients accumulate
+# across all steps. PyTorch handles this automatically via autograd.
 
 def train_lista(X_train, Z_train, X_test, Z_test, Wd, m, T, seed, config):
-    """
-    Train one LISTA model.
-
-    Args:
-        X_train, Z_train: training inputs and Z* targets
-        X_test, Z_test: held-out evaluation data
-        Wd: trained dictionary (for initialization)
-        m: dictionary size
-        T: LISTA depth
-        seed: random seed for reproducibility
-
-    Returns:
-        model: trained LISTA
-        train_history: list of train losses per epoch
-    """
+    """Train one LISTA model for a given (m, T, seed) combination."""
     torch.manual_seed(seed)
     device = config["device"]
 
     n = X_train.shape[1]
     model = LISTA(n, m, T, Wd=Wd.to(device)).to(device)
 
-    # Taken from Notebook 16's optimizer setup pattern
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lista_lr"])
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
-    # Dataset of (X, Z*) pairs
     dataset = torch.utils.data.TensorDataset(X_train, Z_train)
     loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True)
 
@@ -438,13 +422,7 @@ def train_lista(X_train, Z_train, X_test, Z_test, Wd, m, T, seed, config):
             X_batch = X_batch.to(device)
             Z_batch = Z_batch.to(device)
 
-            # Forward: predict sparse codes
             Z_pred = model(X_batch)
-
-            # Loss: squared error between predicted and true sparse codes
-            # WHY MSE and not the full sparse coding energy?
-            # Because we have Z* targets. MSE directly minimizes what we
-            # care about: how close is our prediction to the converged solution.
             loss = F.mse_loss(Z_pred, Z_batch)
 
             optimizer.zero_grad()
@@ -464,26 +442,27 @@ def train_lista(X_train, Z_train, X_test, Z_test, Wd, m, T, seed, config):
 
 
 # =============================================================================
-# 6. EVALUATION
+# 8. FISTA — the evaluation baseline (Figure 3)
 # =============================================================================
-# WHY measure error at each iteration separately?
-# Figure 3 plots error vs. number of iterations. For ISTA, we run it
-# step by step and record the error at each step. For LISTA, a model
-# trained with depth T can be evaluated at intermediate steps 0..T
-# (using return_all_iters=True). This lets us compare: "at iteration k,
-# which method has lower error?"
+# WHY FISTA and not ISTA? Figure 3 in the paper compares LISTA against FISTA,
+# not plain ISTA. FISTA is a faster variant of ISTA that adds a momentum term,
+# making it converge more quickly. It is still much slower than LISTA — the
+# paper shows LISTA needs roughly 20x fewer iterations to reach the same error.
 #
-# The x-axis is inference iterations, not training iterations.
-# LISTA with T=7 is evaluated at steps 0, 1, 2, 3, 5, 7.
-# ISTA is evaluated at steps 0, 1, 2, ... up to 35 (or more).
+# FISTA plays no role in learning W_d or generating Z* targets. It only appears
+# here as the comparison baseline in the evaluation phase.
 
-def evaluate_ista_curve(X_test, Z_test, Wd, config, max_eval_iters=35):
+def evaluate_fista_curve(X_test, Z_test, Wd, config, max_eval_iters=35):
     """
-    Run ISTA step-by-step and record squared error vs. Z* at each step.
+    Run FISTA step by step on X_test, recording mse(Z_current, Z_test) at each step.
+    This produces the gray baseline curve in Figure 3.
 
-    Returns:
-        iters: list of iteration numbers [0, 1, 2, ...]
-        errors: corresponding squared errors (mean over test set)
+    FISTA update:
+      Z_new = h_theta(We @ X + S @ Y)         ← shrinkage applied to momentum variable Y
+      t_new = (1 + sqrt(1 + 4*t^2)) / 2       ← update momentum coefficient
+      Y_new = Z_new + ((t-1)/t_new)*(Z_new - Z_old)  ← momentum step
+
+    We and S are fixed analytically from W_d — not learned.
     """
     device = config["device"]
     Wd = Wd.to(device)
@@ -491,38 +470,51 @@ def evaluate_ista_curve(X_test, Z_test, Wd, config, max_eval_iters=35):
     Z_test = Z_test.to(device)
 
     n, m = Wd.shape
+
+    # Compute fixed matrices analytically from W_d (same as ISTA)
     WtW = Wd.T @ Wd
     L = torch.linalg.eigvalsh(WtW).max().item()
     L = max(L, 1e-6)
-    We_fixed = Wd.T / L
-    S_fixed = torch.eye(m, device=device) - WtW / L
-    theta = config["alpha"] / L
+    We_fixed = Wd.T / L                                      # (m, n)
+    S_fixed = torch.eye(m, device=device) - WtW / L          # (m, m)
+    theta = config["alpha"] / L                              # scalar threshold
 
+    # Initialize Z and momentum variable Y
     Z = torch.zeros(X_test.shape[0], m, device=device)
-    iters = []
-    errors = []
+    Y = Z.clone()
+    t_k = 1.0
 
-    # Step 0: zero initialization
-    iters.append(0)
-    err = F.mse_loss(Z, Z_test).item()
-    errors.append(err)
+    iters = [0]
+    errors = [F.mse_loss(Z, Z_test).item()]
 
     for t in range(1, max_eval_iters + 1):
-        Z = soft_threshold(X_test @ We_fixed.T + Z @ S_fixed.T, theta)
-        err = F.mse_loss(Z, Z_test).item()
+        Z_prev = Z.clone()
+
+        # FISTA step: shrinkage applied to momentum variable Y (not Z directly)
+        Z = soft_threshold(X_test @ We_fixed.T + Y @ S_fixed.T, theta)
+
+        # Momentum coefficient update
+        t_k_next = (1 + (1 + 4 * t_k ** 2) ** 0.5) / 2
+        momentum = (t_k - 1) / t_k_next
+
+        # Momentum variable update: extrapolate beyond Z
+        Y = Z + momentum * (Z - Z_prev)
+        t_k = t_k_next
+
         iters.append(t)
-        errors.append(err)
+        errors.append(F.mse_loss(Z, Z_test).item())
 
     return iters, errors
 
 
+# =============================================================================
+# 9. LISTA EVALUATION
+# =============================================================================
+
 def evaluate_lista_curve(model, X_test, Z_test, config):
     """
     Evaluate a trained LISTA model at each intermediate step 0..T.
-
-    Returns:
-        iters: [0, 1, ..., T]
-        errors: corresponding squared errors
+    Returns iters [0, 1, ..., T] and corresponding mse errors.
     """
     device = config["device"]
     model.eval()
@@ -538,18 +530,16 @@ def evaluate_lista_curve(model, X_test, Z_test, config):
 
 
 # =============================================================================
-# 7. MAIN EXPERIMENT LOOP
+# 10. MAIN EXPERIMENT LOOP
 # =============================================================================
-# Structure:
-#   For each dictionary size m in [100, 400]:
-#     1. Learn W_d
-#     2. Generate Z* for train and test
-#     3. For each depth T in [1, 3, 7]:
-#        For each seed in [0, 1, 2]:
-#          - Train LISTA
-#          - Evaluate and store error curve
-#     4. Compute ISTA curve (once per m, deterministic)
-#     5. Plot Figure 3 equivalent
+# For each dictionary size m in [100, 400]:
+#   1. Learn W_d via CoD + SGD
+#   2. Generate Z* targets for train and test via CoD to convergence
+#   3. Evaluate FISTA curve (once per m — deterministic)
+#   4. For each depth T in [1, 3, 7]:
+#      For each seed in [0, 1, 2]:
+#        - Train LISTA
+#        - Evaluate error curve at steps 0..T
 
 def run_experiments(config):
     X_train, X_test = load_mnist_patches(
@@ -557,7 +547,7 @@ def run_experiments(config):
     )
     n = config["patch_size"] ** 2  # 100
 
-    results = {}  # results[m][T] = {"lista_curves": [...], "ista_curve": (...)}
+    results = {}
 
     for m in config["dict_sizes"]:
         print(f"\n{'='*60}")
@@ -566,19 +556,19 @@ def run_experiments(config):
 
         results[m] = {}
 
-        # Stage 1: Learn dictionary
+        # Stage 1: Learn W_d using CoD
         Wd = learn_dictionary(X_train, m, n, config)
 
-        # Stage 2: Generate Z* targets
+        # Stage 2: Generate Z* targets using CoD to convergence
         Z_train = generate_targets(X_train, Wd, config, f"Z* train (m={m})")
-        Z_test = generate_targets(X_test, Wd, config, f"Z* test (m={m})")
+        Z_test  = generate_targets(X_test,  Wd, config, f"Z* test  (m={m})")
 
-        # Stage 3 (once): ISTA evaluation curve
-        print(f"\nEvaluating ISTA curve (m={m})...")
-        ista_iters, ista_errors = evaluate_ista_curve(X_test, Z_test, Wd, config)
-        results[m]["ista"] = (ista_iters, ista_errors)
+        # Stage 3: FISTA evaluation curve (once per m, deterministic)
+        print(f"\nEvaluating FISTA curve (m={m})...")
+        fista_iters, fista_errors = evaluate_fista_curve(X_test, Z_test, Wd, config)
+        results[m]["fista"] = (fista_iters, fista_errors)
 
-        # Stage 4: Train and evaluate LISTA for each depth T
+        # Stage 4: Train and evaluate LISTA for each depth T and seed
         for T in config["depths"]:
             print(f"\n--- LISTA depth T={T}, m={m} ---")
             lista_curves = []
@@ -588,10 +578,9 @@ def run_experiments(config):
                 model, history = train_lista(
                     X_train, Z_train, X_test, Z_test, Wd, m, T, seed, config
                 )
-                # Evaluate error at each iteration 0..T
                 iters, errors = evaluate_lista_curve(model, X_test, Z_test, config)
                 lista_curves.append((iters, errors))
-                print(f"    Final eval errors: { {i: f'{e:.3f}' for i,e in zip(iters, errors)} }")
+                print(f"    Errors: { {i: f'{e:.3f}' for i,e in zip(iters, errors)} }")
 
             results[m][T] = lista_curves
 
@@ -599,40 +588,32 @@ def run_experiments(config):
 
 
 # =============================================================================
-# 8. PLOTTING — Figure 3 reproduction
+# 11. PLOTTING — Figure 3 reproduction
 # =============================================================================
-# The paper's Figure 3 uses log-log scale (both axes logarithmic).
-# We reproduce this with error bars across seeds.
-#
-# MULTIPLE TRIALS → ERROR BARS:
-# For each (m, T) condition we have num_seeds=3 error curves.
-# We plot the mean ± std across seeds. This shows the result is
-# stable across random initializations, not a lucky run.
-# For ISTA we don't need error bars — it's deterministic.
 
 def plot_figure3(results, config):
+    """
+    Reproduce Figure 3: code prediction error vs. iterations, log-log scale.
+    FISTA is the gray baseline. LISTA curves for T=1,3,7 with error bars.
+    """
     fig, axes = plt.subplots(1, len(config["dict_sizes"]),
                               figsize=(12, 5), sharey=True)
 
     colors = {1: "red", 3: "orange", 7: "blue"}
 
     for ax, m in zip(axes, config["dict_sizes"]):
-        # Plot ISTA
-        ista_iters, ista_errors = results[m]["ista"]
-        ax.plot(ista_iters[:20], ista_errors[:20],
-                "x--", color="gray", label="ISTA", linewidth=1.5, markersize=6)
+        # FISTA baseline — single curve, no error bars (deterministic)
+        fista_iters, fista_errors = results[m]["fista"]
+        ax.plot(fista_iters[:20], fista_errors[:20],
+                "x--", color="gray", label="FISTA", linewidth=1.5, markersize=6)
 
-        # Plot LISTA for each depth T
+        # LISTA curves for each depth T
         for T in config["depths"]:
             curves = results[m][T]
-
-            # Align all curves to the same iteration points
             all_errors = np.array([errors for iters, errors in curves])
-            # all_errors shape: (num_seeds, T+1)
-
             mean_errors = all_errors.mean(axis=0)
-            std_errors = all_errors.std(axis=0)
-            iters = curves[0][0]  # same for all seeds
+            std_errors  = all_errors.std(axis=0)
+            iters = curves[0][0]
 
             ax.errorbar(iters, mean_errors,
                         yerr=std_errors,
@@ -654,7 +635,7 @@ def plot_figure3(results, config):
         ax.set_xticks([1, 2, 3, 5, 7, 10, 20])
         ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
 
-    fig.suptitle("Figure 3 Reproduction: ISTA vs LISTA\n(error bars = std over 3 seeds)",
+    fig.suptitle("Figure 3 Reproduction: FISTA vs LISTA\n(error bars = std over 3 seeds)",
                  fontsize=14)
     plt.tight_layout()
     plt.savefig("figure3_reproduction.png", dpi=150, bbox_inches="tight")
@@ -662,25 +643,23 @@ def plot_figure3(results, config):
     plt.show()
 
 
-def plot_figure3_decimal(results, config):
-    """Plots the same data as Figure 3 but with linear scales."""
+def plot_figure3_linear(results, config):
+    """Same as Figure 3 but with linear axes — easier to read absolute differences."""
     fig, axes = plt.subplots(1, len(config["dict_sizes"]),
-                              figsize=(12, 5), sharey=False) # sharey=False for linear scale
+                              figsize=(12, 5), sharey=False)
 
     colors = {1: "red", 3: "orange", 7: "blue"}
 
     for ax, m in zip(axes, config["dict_sizes"]):
-        # Plot ISTA
-        ista_iters, ista_errors = results[m]["ista"]
-        ax.plot(ista_iters[:20], ista_errors[:20],
-                "x--", color="gray", label="ISTA", linewidth=1.5, markersize=6)
+        fista_iters, fista_errors = results[m]["fista"]
+        ax.plot(fista_iters[:20], fista_errors[:20],
+                "x--", color="gray", label="FISTA", linewidth=1.5, markersize=6)
 
-        # Plot LISTA for each depth T
         for T in config["depths"]:
             curves = results[m][T]
             all_errors = np.array([errors for iters, errors in curves])
             mean_errors = all_errors.mean(axis=0)
-            std_errors = all_errors.std(axis=0)
+            std_errors  = all_errors.std(axis=0)
             iters = curves[0][0]
 
             ax.errorbar(iters, mean_errors,
@@ -692,8 +671,6 @@ def plot_figure3_decimal(results, config):
                         markersize=6,
                         capsize=4)
 
-        ax.set_yscale("linear") # Changed to linear
-        ax.set_xscale("linear") # Changed to linear
         ax.set_xlabel("Iterations", fontsize=12)
         if ax == axes[0]:
             ax.set_ylabel("Code Prediction Error (MSE)", fontsize=12)
@@ -701,392 +678,114 @@ def plot_figure3_decimal(results, config):
                      fontsize=13)
         ax.legend(fontsize=9)
         ax.grid(True, which="both", alpha=0.3)
-        ax.set_xticks(np.arange(0, 21, 2)) # Linear ticks
 
-    fig.suptitle("Figure 3 Reproduction (Decimal Scale)\n(error bars = std over 3 seeds)",
+    fig.suptitle("Figure 3 Reproduction (Linear Scale): FISTA vs LISTA\n(error bars = std over 3 seeds)",
                  fontsize=14)
     plt.tight_layout()
-    plt.savefig("figure3_reproduction_decimal.png", dpi=150, bbox_inches="tight")
-    print("\nSaved figure3_reproduction_decimal.png")
+    plt.savefig("figure3_reproduction_linear.png", dpi=150, bbox_inches="tight")
+    print("Saved figure3_reproduction_linear.png")
     plt.show()
 
+
+# =============================================================================
+# 12. TABLE 1 REPRODUCTION
+# =============================================================================
 
 def print_table1(results, config):
-    """Print reproduction of Table 1: error at T=1,3,7 for each m."""
-    print("\n" + "="*55)
-    print("Table 1 Reproduction: Code Prediction Error")
-    print("="*55)
-    print(f"{'Method':<25} {'m=100':>10} {'m=400':>10}")
-    print("-"*55)
+    """
+    Reproduce Table 1: code prediction error at T=1,3,7 for m=100 and m=400.
+    Compares our results against the paper's reported values.
+    """
+    table_lines = []
+    table_lines.append("=" * 55)
+    table_lines.append("Table 1 Reproduction: Code Prediction Error")
+    table_lines.append("=" * 55)
+    table_lines.append(f"{'Method':<25} {'m=100':>10} {'m=400':>10}")
+    table_lines.append("-" * 55)
+
+    csv_data = []
 
     for T in config["depths"]:
-        errors_100 = results[100][T]
-        errors_400 = results[400][T]
+        curves_100 = results[100][T]
+        curves_400 = results[400][T]
 
-        # Error at final step T (last entry in curve)
-        e100_mean = np.mean([c[1][-1] for c in errors_100])
-        e100_std  = np.std( [c[1][-1] for c in errors_100])
-        e400_mean = np.mean([c[1][-1] for c in errors_400])
-        e400_std  = np.std( [c[1][-1] for c in errors_400])
+        e100_mean = np.mean([c[1][-1] for c in curves_100])
+        e100_std  = np.std( [c[1][-1] for c in curves_100])
+        e400_mean = np.mean([c[1][-1] for c in curves_400])
+        e400_std  = np.std( [c[1][-1] for c in curves_400])
 
-        print(f"LISTA T={T:<18} {e100_mean:>7.2f}±{e100_std:.2f}  {e400_mean:>7.2f}±{e400_std:.2f}")
+        line = f"LISTA T={T:<18} {e100_mean:>7.2f}±{e100_std:.2f}  {e400_mean:>7.2f}±{e400_std:.2f}"
+        table_lines.append(line)
+        csv_data.append({
+            "Method": f"LISTA T={T}",
+            "m=100 mean": e100_mean, "m=100 std": e100_std,
+            "m=400 mean": e400_mean, "m=400 std": e400_std,
+        })
 
-    # ISTA at matching iteration counts
-    print("-"*55)
+    table_lines.append("-" * 55)
+
     for T in config["depths"]:
-        ista_iters_100, ista_errors_100 = results[100]["ista"]
-        ista_iters_400, ista_errors_400 = results[400]["ista"]
+        fista_iters_100, fista_errors_100 = results[100]["fista"]
+        fista_iters_400, fista_errors_400 = results[400]["fista"]
+        if T < len(fista_errors_100):
+            e100 = fista_errors_100[T]
+            e400 = fista_errors_400[T]
+            line = f"FISTA @ iter {T:<13} {e100:>10.2f}  {e400:>10.2f}"
+            table_lines.append(line)
+            csv_data.append({
+                "Method": f"FISTA @ iter {T}",
+                "m=100 mean": e100, "m=100 std": None,
+                "m=400 mean": e400, "m=400 std": None,
+            })
 
-        # find error at iteration T
-        if T < len(ista_errors_100):
-            e100 = ista_errors_100[T]
-            e400 = ista_errors_400[T]
-            print(f"ISTA @ iter {T:<14} {e100:>10.2f}  {e400:>10.2f}")
+    table_lines.append("=" * 55)
+    table_lines.append("\nPaper's Table 1 reference values:")
+    table_lines.append("  LISTA T=1: m=100 → 1.50,  m=400 → 2.45")
+    table_lines.append("  LISTA T=3: m=100 → 0.98,  m=400 → 2.12")
+    table_lines.append("  LISTA T=7: m=100 → 0.52,  m=400 → 1.62")
+    table_lines.append("  FISTA T=1: m=100 → 21.0,  m=400 → 22.0")
 
-    print("="*55)
-    print("\nPaper's Table 1 reference values:")
-    print(f"  LISTA 1 iter: m=100 → 1.50,  m=400 → 2.45")
-    print(f"  LISTA 3 iter: m=100 → 0.98,  m=400 → 2.12")
-    print(f"  LISTA 7 iter: m=100 → 0.52,  m=400 → 1.62")
-    print(f"  FISTA 1 iter: m=100 → 21.0,  m=400 → 22.0")
+    for line in table_lines:
+        print(line)
 
+    with open("table1_results.txt", "w") as f:
+        f.write("\n".join(table_lines))
+    print("\nSaved table1_results.txt")
 
-# =============================================================================
-# 9. MLP BASELINE MODEL
-# =============================================================================
-# WHY compare to an MLP?
-# LISTA has a very specific structure: it unrolls ISTA, uses weight tying,
-# and initializes from W_d. A skeptic could ask: "is the speedup just because
-# you have a trained neural network? Would ANY trained network do just as well?"
-#
-# To answer this, we train a plain feedforward MLP with the same number of
-# parameters as LISTA, but no ISTA structure — no weight tying, no unrolling,
-# just dense layers with ReLU. Both are trained on the same (X, Z*) pairs.
-#
-# If LISTA beats the MLP at the same parameter count, it proves that the
-# inductive bias of the unrolled ISTA structure is doing real work — it's not
-# just "more parameters = better."
-#
-# PARAMETER MATCHING:
-# LISTA with depth T has parameters: We (m×n) + S (m×m) + theta (m)
-# For T=7, m=100, n=100: 100*100 + 100*100 + 100 = 20,100 parameters
-# We build an MLP with the same total parameter count.
-
-class MLP(nn.Module):
-    def __init__(self, n, m, n_params_target):
-        """
-        Two-hidden-layer MLP with ReLU activations.
-        Hidden size is chosen to match LISTA's parameter count.
-
-        Architecture: n -> h -> h -> m
-        Parameters: n*h + h + h*h + h + h*m + m = h*(n+h+m+2) + m
-
-        We solve for h given n_params_target.
-        """
-        super().__init__()
-        # Solve h*(n + h + m + 2) + m = n_params_target
-        # Approximate: h ≈ sqrt(n_params_target) for large h
-        # We use a simple search
-        h = 1
-        while (h * (n + h + m + 2) + m) < n_params_target:
-            h += 1
-        self.hidden = h
-
-        self.net = nn.Sequential(
-            nn.Linear(n, h),
-            nn.ReLU(),
-            nn.Linear(h, h),
-            nn.ReLU(),
-            nn.Linear(h, m),
-        )
-
-    def forward(self, X):
-        return self.net(X)
-
-    def forward(self, X):
-        return self.net(X)
-
-    def count_params(self):
-        return sum(p.numel() for p in self.parameters())
-
-
-def lista_param_count(n, m, T):
-    # We (m×n) + S (m×m) + theta (m), weight-tied across T steps
-    return m * n + m * m + m
-
-
-def train_mlp(X_train, Z_train, X_test, Z_test, n, m, T, seed, config):
-    """Train an MLP with the same parameter count as LISTA with depth T."""
-    torch.manual_seed(seed)
-    device = config["device"]
-
-    n_params = lista_param_count(n, m, T)
-    model = MLP(n, m, n_params_target=n_params).to(device)
-
-    print(f"    MLP hidden size={model.hidden}, "
-          f"params={model.count_params()} "
-          f"(LISTA has {n_params})")
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["lista_lr"])
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-
-    dataset = torch.utils.data.TensorDataset(X_train, Z_train)
-    loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True)
-
-    for epoch in range(config["lista_epochs"]):
-        model.train()
-        epoch_loss = 0
-        for X_batch, Z_batch in loader:
-            X_batch, Z_batch = X_batch.to(device), Z_batch.to(device)
-            Z_pred = model(X_batch)
-            loss = F.mse_loss(Z_pred, Z_batch)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        scheduler.step()
-
-    # Final test error
-    model.eval()
-    with torch.no_grad():
-        Z_pred = model(X_test.to(device))
-        error = F.mse_loss(Z_pred, Z_test.to(device)).item()
-
-    return model, error
-
-
-# =============================================================================
-# 10. DATA EFFICIENCY EXPERIMENT
-# =============================================================================
-# WHY this experiment?
-# LISTA has a strong inductive bias — it knows the solution should look like
-# unrolled ISTA. An MLP has no such prior. The hypothesis is:
-#   - With very little training data, LISTA should outperform MLP significantly,
-#     because its structure guides it even without many examples.
-#   - With lots of data, the gap may narrow as MLP learns the structure empirically.
-#
-# This is a "data efficiency" curve: x = number of training samples,
-# y = test reconstruction error. The professor specifically requested this plot.
-#
-# We run this for a single fixed condition (m=100, T=7) to keep runtime reasonable,
-# comparing LISTA vs MLP vs ISTA (at T=7 iterations as the baseline).
-
-def run_data_efficiency(X_train, Z_train, X_test, Z_test, Wd, config,
-                        m=100, T=7,
-                        data_sizes=None):
-    """
-    Train LISTA and MLP at increasing training set sizes.
-    Returns errors for each model at each data size.
-    """
-    if data_sizes is None:
-        data_sizes = [200, 500, 1000, 2000, 5000, 10000, 25000, 50000]
-
-    device = config["device"]
-    n = X_train.shape[1]
-
-    lista_errors = []  # mean over seeds
-    mlp_errors = []
-    ista_errors_at_T = []
-
-    # ISTA error at T iterations (fixed, doesn't depend on training data)
-    ista_iters, ista_curve = evaluate_ista_curve(X_test, Z_test, Wd, config,
-                                                  max_eval_iters=T)
-    ista_err_at_T = ista_curve[T]  # error at exactly T iterations
-
-    print(f"\nData efficiency experiment (m={m}, T={T})")
-    print(f"ISTA error at T={T} iterations: {ista_err_at_T:.4f}")
-
-    for n_data in data_sizes:
-        print(f"\n  Training on {n_data} samples...")
-        X_sub = X_train[:n_data]
-        Z_sub = Z_train[:n_data]
-
-        # LISTA: average over seeds
-        seed_errors_lista = []
-        for seed in range(config["num_seeds"]):
-            model, _ = train_lista(
-                X_sub, Z_sub, X_test, Z_test, Wd, m, T, seed, config
-            )
-            _, errs = evaluate_lista_curve(model, X_test, Z_test, config)
-            seed_errors_lista.append(errs[-1])  # final step error
-
-        # MLP: average over seeds
-        seed_errors_mlp = []
-        for seed in range(config["num_seeds"]):
-            _, err = train_mlp(X_sub, Z_sub, X_test, Z_test, n, m, T, seed, config)
-            seed_errors_mlp.append(err)
-
-        lista_errors.append((np.mean(seed_errors_lista), np.std(seed_errors_lista)))
-        mlp_errors.append((np.mean(seed_errors_mlp), np.std(seed_errors_mlp)))
-        ista_errors_at_T.append(ista_err_at_T)  # same for all sizes
-
-        print(f"    LISTA: {lista_errors[-1][0]:.4f} ± {lista_errors[-1][1]:.4f}")
-        print(f"    MLP:   {mlp_errors[-1][0]:.4f} ± {mlp_errors[-1][1]:.4f}")
-
-    return data_sizes, lista_errors, mlp_errors, ista_errors_at_T
-
-
-# =============================================================================
-# 11. PLOTTING — MLP comparison and data efficiency
-# =============================================================================
-
-def plot_mlp_comparison(results, mlp_results, config):
-    """
-    Plot ISTA vs LISTA vs MLP error curves on the same axes.
-    Uses m=100, best LISTA depth (T=7) vs matched-parameter MLP.
-
-    WHY this plot: directly answers "is LISTA better because it's a trained
-    network, or because of its structure?" If MLP (same params, no structure)
-    is worse, the answer is clearly: structure matters.
-    """
-    m = 100
-    T = 7
-    device = config["device"]
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    # ISTA curve
-    ista_iters, ista_errors = results[m]["ista"]
-    ax.plot(ista_iters[:15], ista_errors[:15],
-            "x--", color="gray", label="ISTA", linewidth=1.5, markersize=7)
-
-    # LISTA T=7 curve with error bars
-    curves = results[m][T]
-    all_errors = np.array([errs for _, errs in curves])
-    mean_e = all_errors.mean(axis=0)
-    std_e = all_errors.std(axis=0)
-    iters = curves[0][0]
-    ax.errorbar(iters, mean_e, yerr=std_e,
-                fmt="o-", color="blue", label=f"LISTA T={T}",
-                linewidth=1.5, markersize=7, capsize=4)
-
-    # MLP: single point (it's not iterative — just one forward pass)
-    mlp_mean, mlp_std = mlp_results
-    ax.errorbar([T], [mlp_mean], yerr=[mlp_std],
-                fmt="s", color="red", label=f"MLP (matched params)",
-                markersize=10, capsize=6, zorder=5)
-
-    ax.set_yscale("log")
-    ax.set_xscale("log")
-    ax.set_xlabel("Iterations / Equivalent Compute Steps", fontsize=12)
-    ax.set_ylabel("Code Prediction Error (MSE)", fontsize=12)
-    ax.set_title("LISTA vs MLP (matched parameters) vs ISTA\nm=100, T=7",
-                 fontsize=13)
-    ax.legend(fontsize=10)
-    ax.grid(True, which="both", alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig("mlp_comparison.png", dpi=150, bbox_inches="tight")
-    print("Saved mlp_comparison.png")
-    plt.show()
-
-
-def plot_data_efficiency(data_sizes, lista_errors, mlp_errors, ista_errors_at_T, T=7):
-    """
-    Plot test error vs. number of training samples for LISTA, MLP, and ISTA.
-
-    WHY: Shows that LISTA is more data-efficient than MLP — it reaches
-    low error with fewer training examples because its inductive bias
-    (unrolled ISTA structure) guides it even without much data.
-    ISTA is shown as a horizontal line — it doesn't use training data at all,
-    so it's the same regardless of dataset size. It's the "free" baseline.
-    """
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    lista_means = [e[0] for e in lista_errors]
-    lista_stds  = [e[1] for e in lista_errors]
-    mlp_means   = [e[0] for e in mlp_errors]
-    mlp_stds    = [e[1] for e in mlp_errors]
-
-    ax.errorbar(data_sizes, lista_means, yerr=lista_stds,
-                fmt="o-", color="blue", label=f"LISTA T={T}",
-                linewidth=2, markersize=7, capsize=4)
-
-    ax.errorbar(data_sizes, mlp_means, yerr=mlp_stds,
-                fmt="s--", color="red", label="MLP (matched params)",
-                linewidth=2, markersize=7, capsize=4)
-
-    # ISTA as horizontal reference line
-    ax.axhline(y=ista_errors_at_T[0], color="gray", linestyle=":",
-               linewidth=2, label=f"ISTA @ {T} iters (no training data)")
-
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Number of Training Samples", fontsize=12)
-    ax.set_ylabel("Test Code Prediction Error (MSE)", fontsize=12)
-    ax.set_title(f"Data Efficiency: LISTA vs MLP vs ISTA\nm=100, T={T}",
-                 fontsize=13)
-    ax.legend(fontsize=10)
-    ax.grid(True, which="both", alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig("data_efficiency.png", dpi=150, bbox_inches="tight")
-    print("Saved data_efficiency.png")
-    plt.show()
+    with open("table1_results.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["Method", "m=100 mean", "m=100 std", "m=400 mean", "m=400 std"])
+        writer.writeheader()
+        writer.writerows(csv_data)
+    print("Saved table1_results.csv")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(script_dir)
+    print(f"Saving results to: {script_dir}")
+
     results_file = "experiment_results.pkl"
 
-    # --- Experiment 1: Figure 3 reproduction (ISTA vs LISTA) ---
     if os.path.exists(results_file):
         print(f"Loading saved results from {results_file}...")
         with open(results_file, "rb") as f:
             results = pickle.load(f)
     else:
-        print("Running experiments to generate results...")
+        print("Running experiments...")
         results = run_experiments(config)
         print(f"Saving results to {results_file}...")
         with open(results_file, "wb") as f:
             pickle.dump(results, f)
 
     plot_figure3(results, config)
-    plot_figure3_decimal(results, config)
+    plot_figure3_linear(results, config)
     print_table1(results, config)
 
-    # --- Experiment 2: MLP comparison ---
-    # Use the already-trained data from m=100
-    # We need X_train, Z_train, X_test, Z_test, Wd for m=100
-    # Re-run data loading and get m=100 artifacts
-    print("\n" + "="*60)
-    print("Experiment 2: MLP comparison (m=100, T=7)")
-    print("="*60)
-
-    X_train, X_test = load_mnist_patches(
-        config["n_patches_train"], config["n_patches_test"], config["patch_size"]
-    )
-    n = config["patch_size"] ** 2
-
-    # Re-use m=100 dictionary (re-learn for reproducibility as standalone)
-    Wd_100 = learn_dictionary(X_train, m=100, n=n, config=config)
-    Z_train_100 = generate_targets(X_train, Wd_100, config, "Z* train (m=100, MLP exp)")
-    Z_test_100  = generate_targets(X_test,  Wd_100, config, "Z* test  (m=100, MLP exp)")
-
-    # Train MLP with same params as LISTA T=7
-    mlp_seed_errors = []
-    for seed in range(config["num_seeds"]):
-        print(f"  MLP seed {seed+1}/{config['num_seeds']}")
-        _, err = train_mlp(X_train, Z_train_100, X_test, Z_test_100,
-                           n=n, m=100, T=7, seed=seed, config=config)
-        mlp_seed_errors.append(err)
-    mlp_results = (np.mean(mlp_seed_errors), np.std(mlp_seed_errors))
-    print(f"MLP test error: {mlp_results[0]:.4f} ± {mlp_results[1]:.4f}")
-
-    plot_mlp_comparison(results, mlp_results, config)
-
-    # --- Experiment 3: Data efficiency ---
-    print("\n" + "="*60)
-    print("Experiment 3: Data efficiency curve (m=100, T=7)")
-    print("="*60)
-
-    data_sizes, lista_errors, mlp_errors, ista_flat = run_data_efficiency(
-        X_train, Z_train_100, X_test, Z_test_100, Wd_100, config,
-        m=100, T=7,
-        data_sizes=[200, 500, 1000, 2000, 5000, 10000, 25000, 50000]
-    )
-    plot_data_efficiency(data_sizes, lista_errors, mlp_errors, ista_flat, T=7)
-
-    print("\nAll done! Saved: figure3_reproduction.png, mlp_comparison.png, data_efficiency.png")
+    print("\nAll done! Saved:")
+    print("  figure3_reproduction.png  (log-log scale, matches paper)")
+    print("  figure3_reproduction_linear.png  (linear scale)")
+    print("  table1_results.txt")
+    print("  table1_results.csv")
