@@ -23,8 +23,10 @@ def train_ista(
     tol: float,
     verbose: bool,
 ) -> dict[str, object] | None:
+    # Load preprocessed MNIST tensors from disk.
     x_train_tensor, y_train_tensor, x_test_tensor, y_test_tensor = load_mnist_tensors(mnist_dir)
 
+    # Optionally subsample for faster experiments.
     if max_train_samples > 0:
         x_train_tensor = x_train_tensor[:max_train_samples]
         y_train_tensor = y_train_tensor[:max_train_samples]
@@ -32,18 +34,22 @@ def train_ista(
         x_test_tensor = x_test_tensor[:max_test_samples]
         y_test_tensor = y_test_tensor[:max_test_samples]
 
+    # Flatten 28x28 images into vectors and convert to NumPy arrays for the ISTA implementation.
     x_train = x_train_tensor.reshape(x_train_tensor.shape[0], -1).numpy().astype(np.float32)
     y_train = y_train_tensor.numpy().astype(np.int64)
     x_test = x_test_tensor.reshape(x_test_tensor.shape[0], -1).numpy().astype(np.float32)
     y_test = y_test_tensor.numpy().astype(np.int64)
 
+    # Standardize features so optimization is better conditioned.
     scaler = StandardScaler()
     x_train = scaler.fit_transform(x_train)
     x_test = scaler.transform(x_test)
 
+    # Train the sparse linear classifier with ISTA updates.
     model = ISTAClassifier(lambda_reg=lambda_reg, max_iter=max_iter, tol=tol, verbose=verbose)
     model.fit(x_train, y_train, num_classes=10)
 
+    # Evaluate on train and test splits.
     train_predictions = model.predict(x_train)
     test_predictions = model.predict(x_test)
 
@@ -53,6 +59,7 @@ def train_ista(
     if model.weights is None:
         raise RuntimeError("Model weights are unavailable after training.")
 
+    # Report parameter sparsity as a key ISTA property.
     non_zero = int(np.count_nonzero(model.weights))
     total = int(model.weights.size)
     sparsity = 1.0 - (non_zero / total)
@@ -85,8 +92,10 @@ def train_lista(
     save_lista_checkpoint: bool,
     verbose: bool,
 ) -> dict[str, object] | None:
+    # Load preprocessed MNIST tensors from disk.
     x_train_tensor, y_train_tensor, x_test_tensor, y_test_tensor = load_mnist_tensors(mnist_dir)
 
+    # Optionally subsample for faster experiments.
     if max_train_samples > 0:
         x_train_tensor = x_train_tensor[:max_train_samples]
         y_train_tensor = y_train_tensor[:max_train_samples]
@@ -94,13 +103,18 @@ def train_lista(
         x_test_tensor = x_test_tensor[:max_test_samples]
         y_test_tensor = y_test_tensor[:max_test_samples]
 
+    # Flatten images into vectors for fully connected LISTA layers.
     x_train_np = x_train_tensor.reshape(x_train_tensor.shape[0], -1).numpy().astype(np.float32)
     y_train_np = y_train_tensor.numpy().astype(np.int64)
     x_test_np = x_test_tensor.reshape(x_test_tensor.shape[0], -1).numpy().astype(np.float32)
     y_test_np = y_test_tensor.numpy().astype(np.int64)
 
+    # Use GPU when available.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Two modes:
+    # 1) load existing LISTA model + scaler, or
+    # 2) initialize a fresh model and fit a new scaler.
     if load_lista_checkpoint:
         if not lista_checkpoint_path.exists():
             raise FileNotFoundError(
@@ -108,6 +122,7 @@ def train_lista(
                 "Train once with '--save-lista-checkpoint' first."
             )
 
+        # Restore architecture metadata and learned weights.
         checkpoint = torch.load(lista_checkpoint_path, map_location="cpu", weights_only=False)
         checkpoint_input_dim = int(checkpoint["input_dim"])
         checkpoint_code_dim = int(checkpoint["code_dim"])
@@ -127,6 +142,7 @@ def train_lista(
         ).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
 
+        # Rebuild the exact scaler used during checkpoint training.
         scaler_mean = checkpoint["scaler_mean"]
         scaler_scale = checkpoint["scaler_scale"]
         if isinstance(scaler_mean, torch.Tensor):
@@ -147,6 +163,7 @@ def train_lista(
                 f"layers={checkpoint_layers}, code_dim={checkpoint_code_dim}"
             )
     else:
+        # Fresh run: fit scaler on train set and initialize a new LISTA model.
         scaler = StandardScaler()
         x_train_np = scaler.fit_transform(x_train_np)
         model = LISTAClassifier(
@@ -156,25 +173,31 @@ def train_lista(
             num_layers=lista_layers,
         ).to(device)
 
+    # Always transform test data using the training scaler.
     x_test_np = scaler.transform(x_test_np)
     if load_lista_checkpoint:
+        # If we loaded a checkpoint, train features still need this scaler applied.
         x_train_np = scaler.transform(x_train_np)
 
+    # Convert to tensors for PyTorch training/evaluation.
     x_train = torch.from_numpy(x_train_np)
     y_train = torch.from_numpy(y_train_np)
     x_test = torch.from_numpy(x_test_np)
 
+    # Mini-batch data loader for stochastic optimization.
     train_loader = DataLoader(
         TensorDataset(x_train, y_train),
         batch_size=lista_batch_size,
         shuffle=True,
     )
 
+    # Adam optimizer updates all trainable LISTA parameters.
     optimizer = torch.optim.Adam(model.parameters(), lr=lista_lr)
 
     start_time = time.perf_counter()
     history: list[dict[str, float]] = []
 
+    # Main training loop over epochs.
     if lista_epochs > 0:
         for epoch in range(1, lista_epochs + 1):
             model.train()
@@ -188,12 +211,17 @@ def train_lista(
 
                 optimizer.zero_grad()
                 logits, sparse_code = model(features_batch)
+
+                # LISTA objective = classification performance + sparsity pressure on codes.
                 classification_loss = nn.functional.cross_entropy(logits, labels_batch)
                 sparse_penalty = lambda_reg * torch.mean(torch.abs(sparse_code))
                 loss = classification_loss + sparse_penalty
+
+                # Backpropagation and parameter update.
                 loss.backward()
                 optimizer.step()
 
+                # Running epoch metrics.
                 epoch_loss += loss.item() * labels_batch.shape[0]
                 predictions = torch.argmax(logits, dim=1)
                 correct += (predictions == labels_batch).sum().item()
@@ -202,6 +230,7 @@ def train_lista(
             avg_loss = epoch_loss / max(total, 1)
             train_acc = correct / max(total, 1)
 
+            # Quick per-epoch test accuracy snapshot.
             model.eval()
             with torch.no_grad():
                 test_logits_epoch, _ = model(x_test.to(device))
@@ -227,6 +256,7 @@ def train_lista(
     elif verbose:
         print("Skipping LISTA training because --lista-epochs is <= 0.")
 
+    # Final full evaluation and code sparsity statistics.
     model.eval()
     with torch.no_grad():
         train_logits, train_codes = model(x_train.to(device))
@@ -252,6 +282,7 @@ def train_lista(
         f"{near_zero_fraction:.4f} ({train_codes_non_zero}/{train_codes_total} active)"
     )
 
+    # Optionally save weights + architecture + scaler so future runs are reproducible.
     if save_lista_checkpoint:
         lista_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(

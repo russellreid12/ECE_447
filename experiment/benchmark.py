@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import time
 from pathlib import Path
 from typing import cast
@@ -329,5 +330,166 @@ def _lista_sparse_coding_curves(
 
     layer_axis = np.arange(1, model.num_layers + 1, dtype=np.float32)
     return layer_axis, np.asarray(objective_curve, dtype=np.float32), np.asarray(elapsed_curve, dtype=np.float32)
+
+
+def _benchmark_sparse_square(
+    input_side: int,
+    output_prefix: str,
+    plots_dir: Path,
+    lambda_reg: float,
+    max_iter: int,
+    lista_layers: int,
+    lista_code_dim: int,
+    lista_epochs: int,
+    lista_batch_size: int,
+    lista_lr: float,
+    max_train_samples: int,
+    max_test_samples: int,
+) -> None:
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    input_dim = input_side * input_side
+    code_dim = lista_code_dim
+    sparsity_level = max(5, code_dim // 20)
+    train_samples = max_train_samples if max_train_samples > 0 else 5000
+    test_samples = max_test_samples if max_test_samples > 0 else 1000
+
+    rng = np.random.default_rng(447)
+    dictionary = rng.normal(0.0, 1.0, size=(input_dim, code_dim)).astype(np.float32)
+    dictionary = _normalize_dictionary_columns(dictionary)
+
+    true_codes_train = _generate_sparse_codes(train_samples, code_dim, sparsity_level, rng)
+    observations_train = (true_codes_train @ dictionary.T).astype(np.float32)
+    observations_train += 0.01 * rng.normal(size=observations_train.shape).astype(np.float32)
+
+    true_codes_test = _generate_sparse_codes(test_samples, code_dim, sparsity_level, rng)
+    observations_test = (true_codes_test @ dictionary.T).astype(np.float32)
+    observations_test += 0.01 * rng.normal(size=observations_test.shape).astype(np.float32)
+
+    teacher_iter = max(300, max_iter * 3)
+    target_codes_train = _ista_sparse_codes(
+        observations=observations_train,
+        dictionary=dictionary,
+        lambda_reg=lambda_reg,
+        max_iter=teacher_iter,
+    )
+
+    ista_axis, ista_error_curve, _ = _ista_sparse_coding_curves(
+        observations=observations_test,
+        dictionary=dictionary,
+        lambda_reg=lambda_reg,
+        max_iter=max_iter,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lista_model = _train_lista_sparse_coder(
+        observations_train=observations_train,
+        target_codes_train=target_codes_train,
+        dictionary=dictionary,
+        lambda_reg=lambda_reg,
+        input_dim=input_dim,
+        code_dim=code_dim,
+        num_layers=lista_layers,
+        epochs=lista_epochs,
+        batch_size=lista_batch_size,
+        learning_rate=lista_lr,
+        device=device,
+    )
+    lista_axis, lista_error_curve, _ = _lista_sparse_coding_curves(
+        model=lista_model,
+        observations=observations_test,
+        dictionary=dictionary,
+        lambda_reg=lambda_reg,
+        device=device,
+    )
+
+    csv_path = plots_dir / f"{output_prefix}_ista_vs_lista.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["algorithm", "step", "error"])
+        for step, error in zip(ista_axis.tolist(), ista_error_curve.tolist()):
+            writer.writerow(["ISTA", int(step), float(error)])
+        for step, error in zip(lista_axis.tolist(), lista_error_curve.tolist()):
+            writer.writerow(["LISTA", int(step), float(error)])
+
+    plt.figure(figsize=(7, 4.5))
+    plt.plot(ista_axis, ista_error_curve, label="ISTA", linewidth=2)
+    plt.plot(lista_axis, lista_error_curve, label="LISTA", linewidth=2)
+    plt.xlabel("Iteration / Layer")
+    plt.ylabel("Error (objective)")
+    plt.title(f"ISTA vs LISTA on {input_side}x{input_side} sparse coding")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plot_path = plots_dir / f"{output_prefix}_ista_vs_lista_error.png"
+    plt.savefig(plot_path, dpi=160)
+    plt.close()
+
+    print(f"\nSparse {input_side}x{input_side} benchmark complete.")
+    print("Settings:")
+    print(f"- input_size: {input_side}x{input_side} (m={input_dim})")
+    print(f"- code_dim: {code_dim}")
+    print(f"- ista_max_iter: {max_iter}")
+    print(f"- lista_layers: {lista_layers}")
+    print(f"- lista_epochs: {lista_epochs}")
+    print("Recorded outputs:")
+    print(f"- {csv_path}")
+    print(f"- {plot_path}")
+
+
+def benchmark_sparse_10x10(
+    plots_dir: Path,
+    lambda_reg: float,
+    max_iter: int,
+    lista_layers: int,
+    lista_code_dim: int,
+    lista_epochs: int,
+    lista_batch_size: int,
+    lista_lr: float,
+    max_train_samples: int,
+    max_test_samples: int,
+) -> None:
+    _benchmark_sparse_square(
+        input_side=10,
+        output_prefix="sparse_10x10",
+        plots_dir=plots_dir,
+        lambda_reg=lambda_reg,
+        max_iter=max_iter,
+        lista_layers=lista_layers,
+        lista_code_dim=lista_code_dim,
+        lista_epochs=lista_epochs,
+        lista_batch_size=lista_batch_size,
+        lista_lr=lista_lr,
+        max_train_samples=max_train_samples,
+        max_test_samples=max_test_samples,
+    )
+
+
+def benchmark_sparse_20x20(
+    plots_dir: Path,
+    lambda_reg: float,
+    max_iter: int,
+    lista_layers: int,
+    lista_code_dim: int,
+    lista_epochs: int,
+    lista_batch_size: int,
+    lista_lr: float,
+    max_train_samples: int,
+    max_test_samples: int,
+) -> None:
+    _benchmark_sparse_square(
+        input_side=20,
+        output_prefix="sparse_20x20",
+        plots_dir=plots_dir,
+        lambda_reg=lambda_reg,
+        max_iter=max_iter,
+        lista_layers=lista_layers,
+        lista_code_dim=lista_code_dim,
+        lista_epochs=lista_epochs,
+        lista_batch_size=lista_batch_size,
+        lista_lr=lista_lr,
+        max_train_samples=max_train_samples,
+        max_test_samples=max_test_samples,
+    )
 
 
