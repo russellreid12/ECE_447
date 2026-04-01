@@ -688,7 +688,146 @@ def plot_figure3_linear(results, config):
 
 
 # =============================================================================
-# 12. TABLE 1 REPRODUCTION
+# 12. PAPER-STYLE FIGURE 3 — final points only, matching paper's exact style
+# =============================================================================
+# The paper's Figure 3 plots:
+#   - FISTA as a continuous curve (crosses connected by dashed line)
+#   - LISTA as single dots at each depth T=1,3,7 (final error only)
+#   - Log-log scale
+#
+# This matches the paper's presentation exactly — no intermediate steps shown
+# for LISTA, just the final error of each separately trained model.
+
+def plot_figure3_paper_style(results, config):
+    """
+    Reproduce Figure 3 in the paper's exact style:
+      - One plot per dictionary size (side by side)
+      - FISTA shown as full curve with crosses
+      - LISTA shown as single dots at final iteration T only
+      - Log-log scale
+      - No trails between LISTA points
+    """
+    fig, axes = plt.subplots(1, len(config["dict_sizes"]),
+                              figsize=(12, 5), sharey=True)
+
+    lista_colors = {1: "red", 3: "orange", 7: "blue"}
+
+    for ax, m in zip(axes, config["dict_sizes"]):
+
+        # FISTA — full curve, crosses connected by dashed line
+        fista_iters, fista_errors = results[m]["fista"]
+        ax.plot(fista_iters[1:20], fista_errors[1:20],
+                "x--", color="gray", label="FISTA",
+                linewidth=1.5, markersize=7, markeredgewidth=1.5)
+
+        # LISTA — single dot at final step T only, mean ± std across seeds
+        for T in config["depths"]:
+            curves = results[m][T]
+
+            # Take only the LAST error value from each seed (final step T)
+            final_errors = np.array([errors[-1] for iters, errors in curves])
+            mean_err = final_errors.mean()
+            std_err  = final_errors.std()
+
+            ax.errorbar([T], [mean_err],
+                        yerr=[std_err],
+                        fmt="o",
+                        color=lista_colors[T],
+                        label=f"LISTA T={T}",
+                        markersize=8,
+                        capsize=5,
+                        markeredgewidth=1.5,
+                        zorder=5)
+
+        ax.set_yscale("log")
+        ax.set_xscale("log")
+        ax.set_xlabel("Iterations", fontsize=12)
+        ax.set_ylabel("Code Prediction Error", fontsize=12)
+        ax.set_title(f"m={m} ({'complete' if m==100 else '4x overcomplete'})",
+                     fontsize=13)
+        ax.legend(fontsize=9)
+        ax.grid(True, which="both", alpha=0.3)
+        ax.set_xticks([1, 2, 3, 5, 7, 10, 20])
+        ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+
+    fig.suptitle("Figure 3 Reproduction: FISTA vs LISTA\n"
+                 "LISTA dots = final error at depth T (mean ± std over 3 seeds)",
+                 fontsize=13)
+    plt.tight_layout()
+    plt.savefig("figure3_paper_style.png", dpi=150, bbox_inches="tight")
+    print("Saved figure3_paper_style.png")
+    plt.show()
+
+def plot_figure3_combined(results, config):
+    """
+    Reproduce Figure 3 with all conditions on a single plot — matching the
+    paper's original presentation where m=100 and m=400 are overlaid.
+ 
+    Paper uses:
+      - Red  = m=100 (1x complete)
+      - Blue = m=400 (4x overcomplete)
+      - x markers = FISTA, dots = LISTA
+      - Single dots for LISTA at final T only
+      - Log-log scale
+    """
+    fig, ax = plt.subplots(figsize=(8, 6))
+ 
+    # Colors matching the paper: red=1x, blue=4x
+    m_colors = {100: "red", 400: "blue"}
+    m_labels = {100: "1x", 400: "4x"}
+ 
+    for m in config["dict_sizes"]:
+        color = m_colors[m]
+        label = m_labels[m]
+ 
+        # FISTA — full curve with crosses
+        fista_iters, fista_errors = results[m]["fista"]
+        ax.plot(fista_iters[1:20], fista_errors[1:20],
+                "x--", color=color,
+                label=f"FISTA ({label})",
+                linewidth=1.5, markersize=7, markeredgewidth=1.5,
+                alpha=0.7)
+ 
+        # LISTA — single dot at final step T only
+        for T in config["depths"]:
+            curves = results[m][T]
+            final_errors = np.array([errors[-1] for iters, errors in curves])
+            mean_err = final_errors.mean()
+            std_err  = final_errors.std()
+ 
+            # Only add label for first T to avoid legend clutter
+            lista_label = f"LISTA ({label})" if T == config["depths"][0] else "_nolegend_"
+ 
+            ax.errorbar([T], [mean_err],
+                        yerr=[std_err],
+                        fmt="o",
+                        color=color,
+                        label=lista_label,
+                        markersize=8,
+                        capsize=4,
+                        markeredgewidth=1.5,
+                        zorder=5)
+ 
+    ax.set_yscale("log")
+    ax.set_xscale("log")
+    ax.set_xlabel("Iterations", fontsize=12)
+    ax.set_ylabel("Code Prediction Error", fontsize=12)
+    ax.set_title("Figure 3 Reproduction: FISTA vs LISTA\n"
+                 "Red = m=100 (complete), Blue = m=400 (4x overcomplete)",
+                 fontsize=12)
+    ax.legend(fontsize=10)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.set_xticks([1, 2, 3, 5, 7, 10, 20])
+    ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+ 
+    plt.tight_layout()
+    plt.savefig("figure3_combined.png", dpi=150, bbox_inches="tight")
+    print("Saved figure3_combined.png")
+    plt.show()
+
+
+# =============================================================================
+# 13. TABLE 1 REPRODUCTION
 # =============================================================================
 
 def print_table1(results, config):
@@ -782,10 +921,14 @@ if __name__ == "__main__":
 
     plot_figure3(results, config)
     plot_figure3_linear(results, config)
+    plot_figure3_paper_style(results, config)
+    plot_figure3_combined(results, config)
     print_table1(results, config)
 
     print("\nAll done! Saved:")
-    print("  figure3_reproduction.png  (log-log scale, matches paper)")
-    print("  figure3_reproduction_linear.png  (linear scale)")
+    print("  figure3_reproduction.png       (log-log scale, full LISTA curves)")
+    print("  figure3_reproduction_linear.png (linear scale, full LISTA curves)")
+    print("  figure3_paper_style.png        (paper style — LISTA final points only)")
+    print("  figure3_combined.png             (paper style, all conditions on one plot)")
     print("  table1_results.txt")
     print("  table1_results.csv")
