@@ -1,0 +1,11 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.mypy_cache/
+
+# macOS
+.DS_Store
+
+# Local environment folders
+.venv/
+venv/

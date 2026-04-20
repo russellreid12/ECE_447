@@ -1,23 +1,12 @@
 """
-ECE447 Project 1 — LISTA Reproduction
+ECE 447 Project - LISTA
 Gregor & LeCun (2010): "Learning Fast Approximations of Sparse Coding"
 
-Reproduces:
-  - Figure 3: Code prediction error vs. iterations (FISTA vs LISTA)
-  - Table 1: Error at T=1,3,7 iterations for different dictionary sizes
-
-This mirrors the paper's exact setup:
-  - Dictionary learning uses CoD (not ISTA) to generate Z* at each step
-  - Z* targets for LISTA training are generated using CoD to convergence
-  - The evaluation baseline is FISTA (not ISTA) — this is what Figure 3 shows
-  - ISTA does not appear anywhere in this pipeline
-
-MULTIPLE TRIALS NOTE:
-  We train each LISTA configuration (depth T, dict size m) with NUM_SEEDS
-  different random seeds. This gives error bars on our plots and satisfies
-  the rubric's "multiple runs when necessary" requirement. We do NOT need
-  to re-run FISTA multiple times — it is deterministic given a fixed dictionary.
-  The variance comes from LISTA's random weight initialization and SGD.
+We train each LISTA configuration (depth T, dict size m) with NUM_SEEDS
+different random seeds. This gives error bars on our plots and satisfies
+the rubric's "multiple runs when necessary" requirement. We do NOT need
+to re-run FISTA multiple times — it is deterministic given a fixed dictionary.
+The variance comes from LISTA's random weight initialization and SGD.
 """
 
 import torch
@@ -32,14 +21,11 @@ from tqdm import tqdm
 import os
 import pickle
 import csv
+import argparse
+from pathlib import Path
 
-# =============================================================================
-# 0. CONFIGURATION
-# =============================================================================
-# These match the paper's two main conditions: m=100 (complete) and m=400 (4x overcomplete).
-# n=100 because MNIST patches are 10x10.
-# WHY patches instead of full images? The paper explicitly uses 10x10 image patches.
-# This keeps n=100, which makes the math tractable and matches the paper's Table 1.
+# 0. Configuration
+# Two conditions: m=100 (complete) and m=400 (4x overcomplete).
 
 config = {
     # Data
@@ -53,18 +39,18 @@ config = {
     "dict_epochs": 5,
 
     # Sparse coding
-    "alpha": 0.5,              # sparsity penalty weight (matches paper exactly)
+    "alpha": 0.5,              # sparsity penalty weight
     "cod_max_iters": 500,      # CoD iterations to get converged Z* targets
     "cod_tol": 1e-6,           # convergence threshold
 
     # LISTA training
-    "depths": [1, 3, 7],       # T: number of unrolled steps (matches paper's Table 1)
+    "depths": [1, 3, 7],       # T: number of unrolled steps
     "lista_epochs": 10,
     "lista_lr": 1e-3,
     "batch_size": 256,
 
     # Experiment
-    "num_seeds": 3,            # random seeds per (T, m) condition → gives error bars
+    "num_seeds": 3,            # random seeds per (T, m) condition
 
     # Device
     "device": (
@@ -77,9 +63,18 @@ config = {
 print(f"Using device: {config['device']}")
 
 
-# =============================================================================
-# 1. DATA LOADING
-# =============================================================================
+# Output layout
+PROJECT_ROOT = Path(__file__).resolve().parent
+RESULTS_DIR = PROJECT_ROOT / "results"
+FIGURES_DIR = RESULTS_DIR / "figures"
+TABLES_DIR = RESULTS_DIR / "tables"
+CACHE_DIR = RESULTS_DIR / "cache"
+
+for directory in (RESULTS_DIR, FIGURES_DIR, TABLES_DIR, CACHE_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+# 1. Load Data
 
 def load_mnist_patches(n_train, n_test, patch_size):
     """
@@ -105,7 +100,6 @@ def load_mnist_patches(n_train, n_test, patch_size):
         patches = torch.stack(patches)
 
         # Normalize: subtract mean, divide by std
-        # WHY: The paper discards patches with small std. We clamp to avoid division by zero.
         means = patches.mean(dim=1, keepdim=True)
         stds = patches.std(dim=1, keepdim=True).clamp(min=1e-6)
         patches = (patches - means) / stds
@@ -120,9 +114,7 @@ def load_mnist_patches(n_train, n_test, patch_size):
     return X_train, X_test
 
 
-# =============================================================================
-# 2. SHARED UTILITY — soft thresholding
-# =============================================================================
+# 2. Soft Threshold
 
 def soft_threshold(x, theta):
     """
@@ -133,17 +125,8 @@ def soft_threshold(x, theta):
     return torch.sign(x) * F.relu(x.abs() - theta)
 
 
-# =============================================================================
-# 3. COORDINATE DESCENT (CoD) — Algorithm 2 from the paper
-# =============================================================================
-# WHY CoD and not ISTA? The paper explicitly uses CoD as its preferred exact
-# solver for both dictionary learning and Z* target generation. CoD updates
-# one carefully-chosen coordinate at a time (O(m) per step) rather than all
-# coordinates simultaneously (O(m^2) for ISTA), making it faster per iteration.
-#
-# This is used in two places:
-#   - Inside learn_dictionary: rough Z* to guide W_d gradient steps
-#   - Inside generate_targets: precise Z* as LISTA's training labels
+# 3. Coordinate Descent (CoD) for sparse coding
+# Used for learning the dictionary W_d and for generating Z* targets for LISTA training.
 
 def cod(X, Wd, alpha, max_iters, tol=1e-6):
     """
@@ -171,7 +154,6 @@ def cod(X, Wd, alpha, max_iters, tol=1e-6):
     device = X.device
 
     # S = I - Wd^T @ Wd (mutual inhibition matrix, as in Algorithm 2)
-    # WHY: S propagates the effect of updating one code component to all others.
     # When component k changes by e, every Bj shifts by S_jk * e.
     WtW = Wd.T @ Wd                              # (m, m)
     S = torch.eye(m, device=device) - WtW        # (m, m)
@@ -191,18 +173,14 @@ def cod(X, Wd, alpha, max_iters, tol=1e-6):
         diff = (Z_bar - Z).abs()                  # (batch, m)
         k = diff.argmax(dim=1)                    # (batch,) — one index per sample
 
-        # Update only the chosen component for each sample
-        # WHY a Python loop here? CoD is inherently sequential — each step
-        # depends on the previous one. Vectorizing across the batch dimension
-        # is possible but adds complexity. For target generation (run once,
-        # cached), this is fast enough.
+        # Update component for each sample
         for b in range(batch):
             kb = k[b].item()
             e = Z_bar[b, kb] - Z[b, kb]          # scalar change for this component
             B[b] += S[:, kb] * e                  # propagate change to all B entries
             Z[b, kb] = Z_bar[b, kb]               # update only this component
 
-        # Convergence check
+        # Check if converging
         if (Z - Z_prev).norm() < tol:
             break
 
@@ -214,19 +192,15 @@ def cod(X, Wd, alpha, max_iters, tol=1e-6):
     return Z
 
 
-# =============================================================================
-# 4. DICTIONARY LEARNING
-# =============================================================================
-# The paper's exact procedure (Section 4):
+# 4. Learning Dictionary
+# Procedure:
 #   (1) get image patch X_p
 #   (2) compute Z* using CoD
 #   (3) update W_d with one SGD step: W_d <- W_d - eta * dE/dW_d
 #   (4) renormalize columns of W_d to unit norm
 #   (5) repeat with 1/t decaying step size
 #
-# We use Adam instead of vanilla SGD with 1/t schedule — Adam adapts
-# its step size automatically and is more stable in practice.
-# We use CoD (matching the paper) for the Z* inference step.
+# Note: We use Adam instead of vanilla SGD since it's newer
 
 def learn_dictionary(X_train, m, n, config):
     """
@@ -249,15 +223,12 @@ def learn_dictionary(X_train, m, n, config):
         for X_batch in tqdm(loader, desc=f"  Dict epoch {epoch+1}/{config['dict_epochs']}"):
             X_batch = X_batch.to(device)
 
-            # Step 1: get sparse codes via CoD (no grad — not differentiating through CoD)
-            # WHY detach? We only want to update W_d via the reconstruction loss below,
-            # not through the CoD computation itself.
+            # Get sparse code via CoD
             with torch.no_grad():
                 Z_star = cod(X_batch, Wd.detach(), config["alpha"],
                              max_iters=100, tol=1e-4)
 
-            # Step 2: reconstruction loss — dE/dW_d = -(X - W_d @ Z*) @ Z*^T
-            # The L1 term drops out because it has no dependence on W_d.
+            # Reconstruction loss
             X_recon = Z_star @ Wd.T              # (batch, n)
             loss = F.mse_loss(X_recon, X_batch)
 
@@ -265,7 +236,7 @@ def learn_dictionary(X_train, m, n, config):
             loss.backward()
             optimizer.step()
 
-            # Step 3: renormalize columns — no atom should dominate by being large
+            # Renormalize the columns
             with torch.no_grad():
                 Wd.data = F.normalize(Wd.data, dim=0)
 
@@ -276,17 +247,7 @@ def learn_dictionary(X_train, m, n, config):
     return Wd.detach()
 
 
-# =============================================================================
-# 5. GENERATE Z* TARGETS via CoD
-# =============================================================================
-# WHY a separate stage? We run CoD to convergence (500 iters) on every
-# training sample once and cache the results. If we did this inside the
-# LISTA training loop, we'd rerun CoD 500 times per sample per epoch —
-# prohibitively slow. Caching means we pay this cost once.
-#
-# WHY 500 iterations? These Z* values are LISTA's ground truth labels.
-# They must be as close to truly converged as possible — noisy targets
-# mean LISTA learns to approximate a noisy signal.
+# 5. Generate targets using CoD
 
 def generate_targets(X, Wd, config, desc="Generating Z* targets"):
     """Run CoD to convergence on all of X and cache the sparse codes Z*."""
@@ -306,24 +267,18 @@ def generate_targets(X, Wd, config, desc="Generating Z* targets"):
     return torch.cat(all_Z, dim=0)
 
 
-# =============================================================================
-# 6. THE LISTA MODEL
-# =============================================================================
-# WHY a custom nn.Module instead of nn.Linear layers?
-# Because of weight tying: We and S are shared across all T steps.
-# Standard nn.Sequential creates separate weight matrices per layer.
-# We need to explicitly reuse the same matrices in a loop.
+# 6. LISTA Model
 #
 # Architecture:
 #   Input: X of shape (batch, n)
-#   Step 0: Z = h_theta(We @ X)            ← initial estimate
-#   Step t: Z = h_theta(We @ X + S @ Z)    ← refined estimate
+#   Step 0: Z = h_theta(We @ X)
+#   Step t: Z = h_theta(We @ X + S @ Z)
 #   Output: Z of shape (batch, m)
 #
-# Parameters learned (shared across all T steps — weight tying):
-#   We:    (m, n) — replaces (1/L)*Wd^T from ISTA analytically
-#   S:     (m, m) — replaces I - (1/L)*Wd^T*Wd from ISTA analytically
-#   theta: (m,)   — per-dimension threshold, replaces scalar alpha/L
+# Parameters learned:
+#   We:    (m, n)
+#   S:     (m, m)
+#   theta: (m,)
 
 class LISTA(nn.Module):
     def __init__(self, n, m, T, Wd=None):
@@ -343,9 +298,7 @@ class LISTA(nn.Module):
         self.S = nn.Parameter(torch.empty(m, m))
         self.theta = nn.Parameter(torch.ones(m) * 0.1)
 
-        # Smart initialization from W_d
-        # WHY: Starting from the ISTA-derived values gives LISTA a head start —
-        # we know these are already "pretty good". Learning then refines them.
+        # Initialize starting from Wd if provided, otherwise random
         if Wd is not None:
             with torch.no_grad():
                 WtW = Wd.T @ Wd
@@ -386,15 +339,7 @@ class LISTA(nn.Module):
         return Z
 
 
-# =============================================================================
-# 7. LISTA TRAINING
-# =============================================================================
-# LISTA is trained to minimize ||Z_predicted - Z*||^2, where Z* comes from CoD.
-# This is supervised learning with explicit targets — much easier to optimize
-# than the full sparse coding energy directly.
-#
-# Backprop through LISTA is like BPTT in RNNs:
-#   dL/dS = sum_{t=1}^{T} dL/dZ(t) * dZ(t)/dS
+# 7. Training LISTA
 # Since We, S, theta are shared across all T steps, their gradients accumulate
 # across all steps. PyTorch handles this automatically via autograd.
 
@@ -441,21 +386,14 @@ def train_lista(X_train, Z_train, X_test, Z_test, Wd, m, T, seed, config):
     return model, train_history
 
 
-# =============================================================================
-# 8. FISTA — the evaluation baseline (Figure 3)
-# =============================================================================
-# WHY FISTA and not ISTA? Figure 3 in the paper compares LISTA against FISTA,
-# not plain ISTA. FISTA is a faster variant of ISTA that adds a momentum term,
-# making it converge more quickly. It is still much slower than LISTA — the
-# paper shows LISTA needs roughly 20x fewer iterations to reach the same error.
+# 8. FISTA Evaluation
 #
-# FISTA plays no role in learning W_d or generating Z* targets. It only appears
+# NOTE: FISTA plays no role in learning W_d or generating Z* targets. It only appears
 # here as the comparison baseline in the evaluation phase.
 
 def evaluate_fista_curve(X_test, Z_test, Wd, config, max_eval_iters=35):
     """
     Run FISTA step by step on X_test, recording mse(Z_current, Z_test) at each step.
-    This produces the gray baseline curve in Figure 3.
 
     FISTA update:
       Z_new = h_theta(We @ X + S @ Y)         ← shrinkage applied to momentum variable Y
@@ -471,7 +409,7 @@ def evaluate_fista_curve(X_test, Z_test, Wd, config, max_eval_iters=35):
 
     n, m = Wd.shape
 
-    # Compute fixed matrices analytically from W_d (same as ISTA)
+    # Compute fixed matrices analytically from W_d
     WtW = Wd.T @ Wd
     L = torch.linalg.eigvalsh(WtW).max().item()
     L = max(L, 1e-6)
@@ -490,14 +428,14 @@ def evaluate_fista_curve(X_test, Z_test, Wd, config, max_eval_iters=35):
     for t in range(1, max_eval_iters + 1):
         Z_prev = Z.clone()
 
-        # FISTA step: shrinkage applied to momentum variable Y (not Z directly)
+        # Apply shrinkage to momentum variable Y
         Z = soft_threshold(X_test @ We_fixed.T + Y @ S_fixed.T, theta)
 
         # Momentum coefficient update
         t_k_next = (1 + (1 + 4 * t_k ** 2) ** 0.5) / 2
         momentum = (t_k - 1) / t_k_next
 
-        # Momentum variable update: extrapolate beyond Z
+        # Momentum variable update
         Y = Z + momentum * (Z - Z_prev)
         t_k = t_k_next
 
@@ -507,9 +445,7 @@ def evaluate_fista_curve(X_test, Z_test, Wd, config, max_eval_iters=35):
     return iters, errors
 
 
-# =============================================================================
-# 9. LISTA EVALUATION
-# =============================================================================
+# 9. LISTA Evaluation
 
 def evaluate_lista_curve(model, X_test, Z_test, config):
     """
@@ -638,8 +574,9 @@ def plot_figure3(results, config):
     fig.suptitle("Figure 3 Reproduction: FISTA vs LISTA\n(error bars = std over 3 seeds)",
                  fontsize=14)
     plt.tight_layout()
-    plt.savefig("figure3_reproduction.png", dpi=150, bbox_inches="tight")
-    print("\nSaved figure3_reproduction.png")
+    out_path = FIGURES_DIR / "figure3_reproduction.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"\nSaved {out_path}")
     plt.show()
 
 
@@ -682,8 +619,9 @@ def plot_figure3_linear(results, config):
     fig.suptitle("Figure 3 Reproduction (Linear Scale): FISTA vs LISTA\n(error bars = std over 3 seeds)",
                  fontsize=14)
     plt.tight_layout()
-    plt.savefig("figure3_reproduction_linear.png", dpi=150, bbox_inches="tight")
-    print("Saved figure3_reproduction_linear.png")
+    out_path = FIGURES_DIR / "figure3_reproduction_linear.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved {out_path}")
     plt.show()
 
 
@@ -754,8 +692,9 @@ def plot_figure3_paper_style(results, config):
                  "LISTA dots = final error at depth T (mean ± std over 3 seeds)",
                  fontsize=13)
     plt.tight_layout()
-    plt.savefig("figure3_paper_style.png", dpi=150, bbox_inches="tight")
-    print("Saved figure3_paper_style.png")
+    out_path = FIGURES_DIR / "figure3_paper_style.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved {out_path}")
     plt.show()
 
 def plot_figure3_combined(results, config):
@@ -821,8 +760,9 @@ def plot_figure3_combined(results, config):
     ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
  
     plt.tight_layout()
-    plt.savefig("figure3_combined.png", dpi=150, bbox_inches="tight")
-    print("Saved figure3_combined.png")
+    out_path = FIGURES_DIR / "figure3_combined.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved {out_path}")
     plt.show()
 
 
@@ -887,37 +827,53 @@ def print_table1(results, config):
     for line in table_lines:
         print(line)
 
-    with open("table1_results.txt", "w") as f:
+    txt_path = TABLES_DIR / "table1_results.txt"
+    with open(txt_path, "w") as f:
         f.write("\n".join(table_lines))
-    print("\nSaved table1_results.txt")
+    print(f"\nSaved {txt_path}")
 
-    with open("table1_results.csv", "w", newline="") as f:
+    csv_path = TABLES_DIR / "table1_results.csv"
+    with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["Method", "m=100 mean", "m=100 std", "m=400 mean", "m=400 std"])
         writer.writeheader()
         writer.writerows(csv_data)
-    print("Saved table1_results.csv")
+    print(f"Saved {csv_path}")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(script_dir)
-    print(f"Saving results to: {script_dir}")
+    parser = argparse.ArgumentParser(
+        description="Run LISTA experiments with optional cache control."
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Ignore and remove cached experiment results before running.",
+    )
+    args = parser.parse_args()
 
-    results_file = "experiment_results.pkl"
+    script_dir = Path(__file__).resolve().parent
+    os.chdir(script_dir)
+    print(f"Saving results under: {RESULTS_DIR}")
+
+    results_file = CACHE_DIR / "experiment_results.pkl"
+
+    if args.clean and os.path.exists(results_file):
+        print(f"--clean specified: removing cache file {results_file}")
+        os.remove(results_file)
 
     if os.path.exists(results_file):
         print(f"Loading saved results from {results_file}...")
-        with open(results_file, "rb") as f:
-            results = pickle.load(f)
+        with open(results_file, "rb") as f_in:
+            results = pickle.load(f_in)
     else:
         print("Running experiments...")
         results = run_experiments(config)
         print(f"Saving results to {results_file}...")
-        with open(results_file, "wb") as f:
-            pickle.dump(results, f)
+        with open(results_file, "wb") as f_out:
+            pickle.dump(results, f_out)
 
     plot_figure3(results, config)
     plot_figure3_linear(results, config)
@@ -925,10 +881,10 @@ if __name__ == "__main__":
     plot_figure3_combined(results, config)
     print_table1(results, config)
 
-    print("\nAll done! Saved:")
-    print("  figure3_reproduction.png       (log-log scale, full LISTA curves)")
-    print("  figure3_reproduction_linear.png (linear scale, full LISTA curves)")
-    print("  figure3_paper_style.png        (paper style — LISTA final points only)")
-    print("  figure3_combined.png             (paper style, all conditions on one plot)")
-    print("  table1_results.txt")
-    print("  table1_results.csv")
+    print("\nSaved:")
+    print("  results/figures/figure3_reproduction.png         (log-log scale, full LISTA curves)")
+    print("  results/figures/figure3_reproduction_linear.png  (linear scale, full LISTA curves)")
+    print("  results/figures/figure3_paper_style.png          (paper style — LISTA final points only)")
+    print("  results/figures/figure3_combined.png             (paper style, all conditions on one plot)")
+    print("  results/tables/table1_results.txt")
+    print("  results/tables/table1_results.csv")
