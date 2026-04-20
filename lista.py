@@ -53,11 +53,7 @@ config = {
     "num_seeds": 3,            # random seeds per (T, m) condition
 
     # Device
-    "device": (
-        "mps" if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available()
-        else "cpu"
-    ),
+    "device": "cpu",
 }
 
 print(f"Using device: {config['device']}")
