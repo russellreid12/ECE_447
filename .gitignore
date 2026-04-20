@@ -1,37 +1,11 @@
-# Python bytecode and caches
+# Python cache
 __pycache__/
 *.py[cod]
-*$py.class
+.mypy_cache/
 
-# Virtual environments
+# macOS
+.DS_Store
+
+# Local environment folders
 .venv/
 venv/
-env/
-ENV/
-
-# Tooling caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.ipynb_checkpoints/
-
-# OS/editor files
-.DS_Store
-.vscode/
-.idea/
-
-# Local environment/config
-.env
-.env.*
-
-# Project-generated artifacts
-checkpoints/
-plots/
-mnist/
-
-# Downloaded raw dataset files
-data/MNIST/
-
-# Optional logs and temporary files
-*.log
-*.tmp

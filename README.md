@@ -1,53 +1,59 @@
-# ECE 447 LISTA Project
+# ECE 447 LISTA Reproduction
 
-Simple quick-start guide for running MNIST experiments.
+Reproduction of Gregor and LeCun (2010), including:
+- Figure 3 comparisons of FISTA vs LISTA
+- Table 1 code prediction error for dictionary sizes m=100 and m=400
 
-## 1) Install dependencies
+## Project Layout
 
-From the project root:
-
-```bash
-python3 -m pip install -r requirements.txt
+```
+project/
+├── lista.py                 # Main experiment/training script
+├── data/                    # MNIST dataset storage
+├── mnist/                   # Reserved/alternate MNIST assets
+├── plots/                   # Legacy plotting outputs and CSVs
+├── checkpoints/             # Optional model checkpoints
+├── docs/
+│   └── papers/              # Reference PDFs
+└── results/
+	├── cache/               # Serialized experiment artifacts (.pkl)
+	├── figures/             # Generated PNG plots
+	└── tables/              # Generated table outputs (.txt/.csv)
 ```
 
-## 2) Generate MNIST tensors
+## Getting Started
+
+### Conda Environment Setup
+
+Create and activate a dedicated conda environment:
 
 ```bash
-python3 main.py --task generate
+conda create -n ece447-lista python=3.11 -y
+conda activate ece447-lista
 ```
 
-This creates tensor files under `mnist/`.
-
-## 3) Train ISTA
+Install project dependencies from `requirements.txt`:
 
 ```bash
-python3 main.py --task train
+python -m pip install -r requirements.txt
 ```
 
-## 4) Train LISTA
+## Running Experiments
+
+Run from the project root:
 
 ```bash
-python3 main.py --task train-lista
+python lista.py
 ```
 
-Example with custom settings:
+The script writes outputs to:
+- `results/cache/experiment_results.pkl`
+- `results/figures/*.png`
+- `results/tables/table1_results.txt`
+- `results/tables/table1_results.csv`
 
-```bash
-python3 main.py --task train-lista \
-  --lista-layers 3 \
-  --lista-code-dim 256 \
-  --lista-epochs 1000
-```
+## Notes
 
-## 5) Run benchmark plots
-
-```bash
-python3 main.py --task benchmark
-```
-
-Plots are saved to `plots/`.
-
-## 6) Helpful docs
-
-- ISTA guide: `docs/train_ista.md`
-- LISTA guide: `docs/train_lista.md`
+- If `results/cache/experiment_results.pkl` exists, the script reuses cached results.
+- Remove that file if you want a full retrain and rerun.
+- Training from scratch takes a long time (usually >1 hour)
