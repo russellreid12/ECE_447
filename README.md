@@ -1,20 +1,14 @@
 # ECE 447 LISTA Reproduction
 
-Reproduction of Gregor and LeCun (2010), including:
-- Figure 3 comparisons of FISTA vs LISTA
-- Table 1 code prediction error for dictionary sizes m=100 and m=400
+This project reproduces the LISTA experiments from Gregor and LeCun (2010) and compares the learned sparse-coding model against FISTA on the MNIST-based setup used in the paper.
 
-## Project Layout
+## How It Works
 
-```
-project/
-├── lista.py                 # Main experiment/training script
-├── data/                    # MNIST dataset storage
-└── results/
-	├── cache/               # Serialized experiment artifacts (.pkl)
-	├── figures/             # Generated PNG plots
-	└── tables/              # Generated table outputs (.txt/.csv)
-```
+- Loads the MNIST data and prepares the sparse-coding experiments used in the paper.
+- Trains a LISTA model to compare against FISTA on the same problem setup.
+- Saves the resulting figures, tables, and cached experiment outputs in the `results/` folder.
+
+See the paper [here](./gregor-2010-lista.pdf) for more details.
 
 ## Getting Started
 
@@ -35,10 +29,23 @@ python -m pip install -r requirements.txt
 
 ## Running Experiments
 
+### Run Experiment From Cache (Pre-trained Model)
+
 Run from the project root:
 
 ```bash
 python lista.py
+```
+
+- This uses the existing model that has been trained in `results/cache/experiment_results.pkl`
+- This is done because training the model takes a long time (up to 1 hour depending on computer speed)
+- To run from scratch, see the next section
+
+### Run Experiment From Scratch
+
+Run from the project root:
+```bash
+python lista.py --clean
 ```
 
 The script writes outputs to:
@@ -47,8 +54,23 @@ The script writes outputs to:
 - `results/tables/table1_results.txt`
 - `results/tables/table1_results.csv`
 
-## Notes
+- NOTE: This takes a long time to execute!
 
-- If `results/cache/experiment_results.pkl` exists, the script reuses cached results.
-- Remove that file if you want a full retrain and rerun.
-- Training from scratch takes a long time (usually >1 hour)
+## Project Layout
+
+```
+project/
+├── lista.py                 # Main experiment/training script
+├── data/                    # MNIST dataset storage
+└── results/
+	├── cache/               # Serialized experiment artifacts (.pkl)
+	├── figures/             # Generated PNG plots
+	└── tables/              # Generated table outputs (.txt/.csv)
+```
+
+## References
+
+- Python implementation of the Fast Iterative Shrinkage-Thresholding Algorithm (FISTA): https://github.com/jeankossaifi/fista
+
+
+
