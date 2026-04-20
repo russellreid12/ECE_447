@@ -10,11 +10,6 @@ Reproduction of Gregor and LeCun (2010), including:
 project/
 ├── lista.py                 # Main experiment/training script
 ├── data/                    # MNIST dataset storage
-├── mnist/                   # Reserved/alternate MNIST assets
-├── plots/                   # Legacy plotting outputs and CSVs
-├── checkpoints/             # Optional model checkpoints
-├── docs/
-│   └── papers/              # Reference PDFs
 └── results/
 	├── cache/               # Serialized experiment artifacts (.pkl)
 	├── figures/             # Generated PNG plots
