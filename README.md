@@ -61,6 +61,7 @@ The script writes outputs to:
 ```
 project/
 ├── lista.py                 # Main experiment/training script
+├── PROJECT_REPORT.pdf       # Written report for the project
 ├── data/                    # MNIST dataset storage
 └── results/
 	├── cache/               # Serialized experiment artifacts (.pkl)
